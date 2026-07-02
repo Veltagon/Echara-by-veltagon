@@ -1,6 +1,8 @@
 # Milestone 2.5 + 3 Report — Skill Router + Provider Routing
 
-Status: **complete. `pytest tests/ -v` → 22 passed, 0 failed.**
+Status: **complete. `pytest tests/ -v` → 30 passed, 0 failed.** (Post-audit
+hardening added 4 references/-gate tests + 4 cooldown tests; see "Guide-vs-spec
+audit" below.)
 
 ## Files created
 
@@ -36,31 +38,39 @@ Status: **complete. `pytest tests/ -v` → 22 passed, 0 failed.**
 platform win32 -- Python 3.14.6, pytest-8.2.2, pluggy-1.6.0
 rootdir: C:\Users\white\OneDrive\文档\programms\echara
 plugins: anyio-4.14.0, hypothesis-6.155.7, locust-2.44.4, asyncio-0.23.7, benchmark-5.2.3, cov-7.1.0
-collected 22 items
+collected 30 items
 
-tests/test_full_system.py::test_end_to_end_mock PASSED                   [  4%]
-tests/test_integration_skill_provider.py::test_skill_loaded_into_api_session PASSED [  9%]
-tests/test_integration_skill_provider.py::test_cli_skill_index_written PASSED [ 13%]
-tests/test_providers.py::test_config_loading PASSED                      [ 18%]
-tests/test_providers.py::test_adapter_instantiation PASSED               [ 22%]
-tests/test_providers.py::test_fallback_on_failure PASSED                 [ 27%]
-tests/test_providers.py::test_all_providers_exhausted PASSED             [ 31%]
-tests/test_providers.py::test_role_routing PASSED                        [ 36%]
-tests/test_skill_router.py::test_frontmatter_extraction PASSED           [ 40%]
-tests/test_skill_router.py::test_role_skill_assignment PASSED            [ 45%]
+tests/test_full_system.py::test_end_to_end_mock PASSED                   [  3%]
+tests/test_integration_skill_provider.py::test_skill_loaded_into_api_session PASSED [  6%]
+tests/test_integration_skill_provider.py::test_cli_skill_index_written PASSED [ 10%]
+tests/test_providers.py::test_config_loading PASSED                      [ 13%]
+tests/test_providers.py::test_adapter_instantiation PASSED               [ 16%]
+tests/test_providers.py::test_fallback_on_failure PASSED                 [ 20%]
+tests/test_providers.py::test_all_providers_exhausted PASSED             [ 23%]
+tests/test_providers.py::test_role_routing PASSED                        [ 26%]
+tests/test_providers.py::test_looks_rate_limited_signatures PASSED       [ 30%]
+tests/test_providers.py::test_cooldown_skips_exhausted_provider PASSED   [ 33%]
+tests/test_providers.py::test_rate_limit_error_marks_provider_on_cooldown PASSED [ 36%]
+tests/test_providers.py::test_non_rate_limit_error_does_not_cooldown PASSED [ 40%]
+tests/test_skill_router.py::test_frontmatter_extraction PASSED           [ 43%]
+tests/test_skill_router.py::test_role_skill_assignment PASSED            [ 46%]
 tests/test_skill_router.py::test_token_budget_enforcement PASSED         [ 50%]
-tests/test_skill_router.py::test_skill_index_generation PASSED           [ 54%]
-tests/test_skill_router.py::test_full_body_load_on_demand PASSED         [ 59%]
-tests/test_tool_harness.py::test_read_file PASSED                        [ 63%]
-tests/test_tool_harness.py::test_write_file PASSED                       [ 68%]
-tests/test_tool_harness.py::test_list_dir PASSED                         [ 72%]
-tests/test_tool_harness.py::test_bash_run PASSED                         [ 77%]
-tests/test_tool_harness.py::test_bash_run_timeout PASSED                 [ 81%]
-tests/test_tool_harness.py::test_done_stops_loop PASSED                  [ 86%]
-tests/test_tool_harness.py::test_max_iterations_guard PASSED             [ 90%]
-tests/test_tool_harness.py::test_tool_loop_produces_output PASSED        [ 95%]
-tests/test_tool_harness.py::test_five_tools_registered PASSED            [100%]
-============================= 22 passed in 4.41s ==============================
+tests/test_skill_router.py::test_skill_index_generation PASSED           [ 53%]
+tests/test_skill_router.py::test_full_body_load_on_demand PASSED         [ 56%]
+tests/test_tool_harness.py::test_read_file PASSED                        [ 60%]
+tests/test_tool_harness.py::test_write_file PASSED                       [ 63%]
+tests/test_tool_harness.py::test_list_dir PASSED                         [ 66%]
+tests/test_tool_harness.py::test_bash_run PASSED                         [ 70%]
+tests/test_tool_harness.py::test_bash_run_timeout PASSED                 [ 73%]
+tests/test_tool_harness.py::test_done_stops_loop PASSED                  [ 76%]
+tests/test_tool_harness.py::test_max_iterations_guard PASSED             [ 80%]
+tests/test_tool_harness.py::test_tool_loop_produces_output PASSED        [ 83%]
+tests/test_tool_harness.py::test_five_tools_registered PASSED            [ 86%]
+tests/test_tool_harness.py::test_touches_references_helper PASSED        [ 90%]
+tests/test_tool_harness.py::test_references_gate_intercepts_small_context PASSED [ 93%]
+tests/test_tool_harness.py::test_references_allowed_large_context PASSED [ 96%]
+tests/test_tool_harness.py::test_references_gate_off_when_window_unknown PASSED [100%]
+============================= 30 passed in 8.09s ==============================
 ```
 (~960 DeprecationWarnings from the pytest-asyncio plugin under Python 3.14 —
 third-party noise, unrelated to this code.)
@@ -76,6 +86,24 @@ See `DECISIONS.md`. Highlights: real skill pool is `engineering-team/skills`
 (the `.gemini` copies are Windows symlink stubs); skill IDs flat + mapped to
 real skills; heavy reuse of the M2.5 harness; one circular import found and
 root-caused (lazy `_kill_tree` import).
+
+## Guide-vs-spec audit (post-signoff)
+
+Reviewed the guide.md M3 section against what shipped. Three gaps found; 2
+closed, 1 explicitly deferred. See `DECISIONS.md` for full detail.
+
+- ✅ **`references/` gate** for small-context models (guide.md exact quote:
+  "if model context window < 16K tokens, intercept read_file calls to
+  references/…"). Implemented in `providers/tool_harness.py` + `ApiAdapter` +
+  config knob. 4 tests.
+- ✅ **Cooldowns** for API providers (guide.md: "rate limit handling, cooldowns,
+  budget tracking"). `call_with_fallback` now consults `providers.availability`;
+  a 429-shaped failure marks the provider unavailable for 60s so the next call
+  skips it. 4 tests.
+- ⏸️ **Cross-provider live comparison** (guide.md acceptance test) — deferred.
+  Blocked on funded API keys. Only Cerebras is live; anthropic/openai/openrouter
+  keys are placeholders. Infrastructure is ready; command staged in
+  `DECISIONS.md`.
 
 ## Known limitations / shortcuts
 - **Skill ID → path is flat**, not the spec's `domain/skill`. Real repo is flat.

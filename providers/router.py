@@ -9,13 +9,26 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from pathlib import Path
 
 import yaml
 
+from providers import availability
 from providers.api_adapter import ApiAdapter
 from providers.base import ProviderBase
 from providers.cli_adapter import CliAdapter
+
+# Default cooldown when we detect a rate-limit-shaped error but no explicit
+# retry-after. Keep short so a genuinely-recovered provider isn't blackholed.
+_DEFAULT_COOLDOWN_SEC = 60.0
+
+
+def _looks_rate_limited(e: BaseException) -> bool:
+    """Cheap signature match on the exception. Covers HTTP 429 wrappers,
+    litellm RateLimitError, and plain 'rate limit' text."""
+    s = f"{type(e).__name__} {e}".lower()
+    return "429" in s or "ratelimit" in s.replace(" ", "").replace("_", "")
 
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ECHARA_ROOT / "provider_config.yaml"
@@ -58,7 +71,10 @@ class ProviderRouter:
         if ptype == "cli":
             return CliAdapter(name, c["command"])
         if ptype is None and "model" in c:  # API providers carry a model, no type
-            return ApiAdapter(name, c["model"], _resolve_env(c.get("api_key")))
+            return ApiAdapter(
+                name, c["model"], _resolve_env(c.get("api_key")),
+                context_window=c.get("context_window"),
+            )
         raise ValueError(f"provider {name!r} has unknown type {ptype!r}")
 
     def get_provider(self, role: str) -> ProviderBase:
@@ -68,17 +84,30 @@ class ProviderRouter:
 
     def call_with_fallback(self, work, order: list[str] | None = None):
         """Run `work(adapter)` against each provider in fallback_order until one
-        succeeds. Each provider is tried once; failures are logged and collected.
-        All fail -> AllProvidersExhausted."""
+        succeeds. Providers currently on cooldown (see providers.availability)
+        are skipped without a call. On a rate-limit-shaped failure, the
+        provider is marked exhausted for _DEFAULT_COOLDOWN_SEC so the next
+        call_with_fallback skips it. All fail -> AllProvidersExhausted."""
         import logging
         log = logging.getLogger("echara.provider_router")
         order = order or self.fallback_order
         errors: dict[str, BaseException] = {}
         for name in order:
+            avail = availability.status(name)
+            if not avail.available:
+                log.info("provider %s on cooldown (%ds left) — skipping",
+                         name, int(avail.seconds_until_reset))
+                errors[name] = RuntimeError(
+                    f"cooling down for {int(avail.seconds_until_reset)}s")
+                continue
             try:
                 adapter = self.make_adapter(name)
                 return work(adapter)
             except Exception as e:  # noqa: BLE001 — any failure → next provider
                 log.warning("provider %s failed: %r — falling back", name, e)
                 errors[name] = e
+                if _looks_rate_limited(e):
+                    availability.mark_exhausted(name, time.time() + _DEFAULT_COOLDOWN_SEC)
+                    log.warning("provider %s marked on cooldown for %ds",
+                                name, int(_DEFAULT_COOLDOWN_SEC))
         raise AllProvidersExhausted(errors)

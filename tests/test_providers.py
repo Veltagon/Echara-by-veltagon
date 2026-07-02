@@ -4,11 +4,14 @@ from __future__ import annotations
 import pytest
 
 from providers import CliAdapter, ApiAdapter, ProviderRouter, AllProvidersExhausted
-from providers.router import DEFAULT_CONFIG
+from providers import availability
+from providers.router import DEFAULT_CONFIG, _looks_rate_limited
 
 
 @pytest.fixture
 def router():
+    # Availability is process-global; wipe any state prior tests left behind.
+    availability.reset()
     return ProviderRouter(DEFAULT_CONFIG)
 
 
@@ -62,3 +65,60 @@ def test_role_routing(router):
     assert isinstance(planner, ApiAdapter) and planner.name == "anthropic"
     builder = router.get_provider("builder")
     assert isinstance(builder, CliAdapter) and builder.name == "claude_code"
+
+
+# --- guide.md M3: cooldowns for API providers -------------------------------
+
+def test_looks_rate_limited_signatures():
+    assert _looks_rate_limited(RuntimeError("HTTP 429 Too Many Requests"))
+    assert _looks_rate_limited(RuntimeError("openai.RateLimitError: quota"))
+    class RateLimitError(Exception): ...
+    assert _looks_rate_limited(RateLimitError("slow down"))
+    assert not _looks_rate_limited(ConnectionError("dns"))
+
+
+def test_cooldown_skips_exhausted_provider(router):
+    """A provider already on cooldown must be SKIPPED without being called."""
+    import time
+    availability.mark_exhausted("anthropic", time.time() + 30)
+    calls = []
+
+    def work(adapter):
+        calls.append(adapter.name)
+        return f"ok:{adapter.name}"
+
+    result = router.call_with_fallback(work, order=["anthropic", "chatgpt"])
+    assert result == "ok:chatgpt"
+    assert calls == ["chatgpt"]  # anthropic was skipped, never invoked
+
+
+def test_rate_limit_error_marks_provider_on_cooldown(router):
+    """A rate-limit-shaped failure must put the provider on the cooldown list."""
+    assert availability.is_available("anthropic")  # sanity
+
+    def work(adapter):
+        if adapter.name == "anthropic":
+            raise RuntimeError("HTTP 429 rate limit exceeded")
+        return f"ok:{adapter.name}"
+
+    router.call_with_fallback(work, order=["anthropic", "chatgpt"])
+    assert not availability.is_available("anthropic")
+
+    # A second call in the same window skips anthropic entirely — proves the
+    # cooldown is honored end-to-end, not just recorded.
+    seen = []
+    def work2(adapter):
+        seen.append(adapter.name); return "ok"
+    router.call_with_fallback(work2, order=["anthropic", "chatgpt"])
+    assert seen == ["chatgpt"]
+
+
+def test_non_rate_limit_error_does_not_cooldown(router):
+    """A ConnectionError shouldn't blackhole the provider — that's for 429s."""
+    def work(adapter):
+        if adapter.name == "anthropic":
+            raise ConnectionError("dns fail")
+        return "ok"
+
+    router.call_with_fallback(work, order=["anthropic", "chatgpt"])
+    assert availability.is_available("anthropic")  # still available after ConnectionError

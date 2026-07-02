@@ -104,3 +104,74 @@ def test_tool_loop_produces_output(ctx, tmp_path):
 
 def test_five_tools_registered():
     assert TOOL_NAMES == ["read_file", "write_file", "list_dir", "bash_run", "done"]
+
+
+# --- guide.md M3: references/ gate for small-context models -----------------
+
+from providers.tool_harness import (
+    _touches_references, REFERENCES_REFUSAL, SMALL_CONTEXT_FLOOR,
+)
+
+
+def test_touches_references_helper():
+    assert _touches_references("skills/senior-backend/references/api.md")
+    assert _touches_references("skills\\senior-backend\\references\\api.md")  # Windows
+    assert _touches_references("references/foo.md")
+    assert not _touches_references("skills/senior-backend/SKILL.md")
+    assert not _touches_references("references.md")  # file named `references`, not a segment
+
+
+def test_references_gate_intercepts_small_context(ctx, tmp_path):
+    # Set up a real references/ file so we can prove the gate returns the
+    # refusal string INSTEAD of the file's content.
+    refs = tmp_path / "skills" / "senior-backend" / "references"
+    refs.mkdir(parents=True)
+    (refs / "api.md").write_text("SECRET_ACTUAL_CONTENT", encoding="utf-8")
+
+    model = ScriptedModel([
+        _resp(tool_calls=[_tc("c1", "read_file",
+              {"path": "skills/senior-backend/references/api.md"})]),
+        _resp(tool_calls=[_tc("c2", "done", {"summary": "attempted"})]),
+    ])
+    result = run_tool_loop(
+        model, [{"role": "user", "content": "read the reference"}], ctx,
+        max_iterations=10, context_window=SMALL_CONTEXT_FLOOR - 1,
+    )
+    tool_msgs = [m for m in result["messages"] if m.get("role") == "tool"]
+    # The read_file tool message carries the refusal, not the file content.
+    read_result = tool_msgs[0]["content"]
+    assert read_result == REFERENCES_REFUSAL
+    assert "SECRET_ACTUAL_CONTENT" not in read_result
+
+
+def test_references_allowed_large_context(ctx, tmp_path):
+    refs = tmp_path / "skills" / "senior-backend" / "references"
+    refs.mkdir(parents=True)
+    (refs / "api.md").write_text("full-body content", encoding="utf-8")
+
+    model = ScriptedModel([
+        _resp(tool_calls=[_tc("c1", "read_file",
+              {"path": "skills/senior-backend/references/api.md"})]),
+        _resp(tool_calls=[_tc("c2", "done", {"summary": "read it"})]),
+    ])
+    result = run_tool_loop(
+        model, [{"role": "user", "content": "read"}], ctx,
+        max_iterations=10, context_window=32000,  # over the floor
+    )
+    read_result = [m for m in result["messages"] if m.get("role") == "tool"][0]["content"]
+    assert "full-body content" in read_result
+    assert read_result != REFERENCES_REFUSAL
+
+
+def test_references_gate_off_when_window_unknown(ctx, tmp_path):
+    # context_window=None → no gate, model reads normally.
+    (tmp_path / "references").mkdir()
+    (tmp_path / "references" / "x.md").write_text("readable", encoding="utf-8")
+    model = ScriptedModel([
+        _resp(tool_calls=[_tc("c1", "read_file", {"path": "references/x.md"})]),
+        _resp(tool_calls=[_tc("c2", "done", {"summary": "ok"})]),
+    ])
+    result = run_tool_loop(model, [{"role": "user", "content": "go"}], ctx,
+                           max_iterations=10)  # no context_window
+    read_result = [m for m in result["messages"] if m.get("role") == "tool"][0]["content"]
+    assert "readable" in read_result

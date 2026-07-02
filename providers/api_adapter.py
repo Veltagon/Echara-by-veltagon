@@ -17,10 +17,12 @@ from providers import tool_harness
 class ApiAdapter(ProviderBase):
     category = "api"
 
-    def __init__(self, name: str, model: str, api_key: str | None = None, complete_fn=None):
+    def __init__(self, name: str, model: str, api_key: str | None = None,
+                 complete_fn=None, context_window: int | None = None):
         super().__init__(name)
         self.model = model
         self.api_key = api_key
+        self.context_window = context_window  # enables the small-context refs/ gate
         self._complete_fn = complete_fn  # test/DI hook
 
     def complete(self, messages: list[dict], tools: list[dict] | None = None):
@@ -45,7 +47,10 @@ class ApiAdapter(ProviderBase):
         return resp.choices[0].message.content or ""
 
     def send_with_tools(self, messages: list[dict], ctx: Context, max_iterations: int = 30) -> dict:
-        return tool_harness.run_tool_loop(self.complete, messages, ctx, max_iterations)
+        return tool_harness.run_tool_loop(
+            self.complete, messages, ctx, max_iterations,
+            context_window=self.context_window,
+        )
 
     @property
     def tools(self) -> list[dict]:

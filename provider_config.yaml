@@ -3,15 +3,21 @@
 # See DECISIONS.md for how this maps onto the existing M2 CLI providers.
 
 providers:
+  # `context_window` (tokens) is optional. When set and < 16000, the tool
+  # harness gates read_file calls into a skill's references/ subdir per
+  # guide.md M3. Omit it to leave the gate off.
   anthropic:
     api_key: "${ANTHROPIC_API_KEY}"
     model: "claude-sonnet-4-20250514"
+    context_window: 200000
   chatgpt:
     api_key: "${OPENAI_API_KEY}"
     model: "gpt-4o-mini"
+    context_window: 128000
   openrouter:
     api_key: "${OPENROUTER_API_KEY}"
     model: "anthropic/claude-sonnet-4-20250514"
+    context_window: 200000
   claude_code:
     type: cli
     command: "claude"

@@ -140,6 +140,12 @@ class Provider(ABC):
     # Per-provider idle threshold. Override in subclass when the CLI is
     # legitimately quiet between bytes (Claude -p text only emits final text).
     idle_limit_sec: int = 60
+    # Deliver the prompt via stdin instead of argv. Windows argv ceilings are
+    # 8,191 chars for .cmd shims (codex) and ~32K for exes — a builder prompt
+    # embedding PLAN.md + contract crossed the 8K line on 2026-07-02
+    # ("The command line is too long."). build_argv still receives the prompt
+    # and should put a placeholder like "-" in the argv when this is True.
+    stdin_prompt: bool = False
 
     @abstractmethod
     def build_argv(self, prompt: str, cwd: Path) -> list[str]:
@@ -189,9 +195,17 @@ class Provider(ABC):
                     cwd=str(cwd),
                     stdout=out,
                     stderr=err,
-                    stdin=subprocess.DEVNULL,
+                    stdin=subprocess.PIPE if self.stdin_prompt else subprocess.DEVNULL,
                     env=merged_env,
                 )
+                if self.stdin_prompt:
+                    # Prompt is a few KB; OS pipe buffers dwarf it, so a
+                    # synchronous write-and-close can't deadlock here.
+                    try:
+                        proc.stdin.write(prompt.encode("utf-8"))
+                        proc.stdin.close()
+                    except OSError:
+                        pass  # child died early — exit code will tell the story
                 watcher_thread = threading.Thread(
                     target=_idle_watcher,
                     args=(

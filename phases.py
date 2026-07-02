@@ -21,6 +21,12 @@ class VerifyFailed(Exception):
     """Verification failed. str(exc) is the exact error fed back to Builder."""
 
 
+class AgentDispatchError(Exception):
+    """An agent could not run at all (every provider lane down / invalid plan).
+    Distinct from bad output — that's the Verifier's job. The orchestrator
+    stamps a failed verdict and leaves state resumable."""
+
+
 def real_agents() -> dict:
     """Late imports so the dry-run path never loads provider/LLM machinery."""
     from agents import builder, planner, repairs, verifier

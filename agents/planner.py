@@ -13,6 +13,7 @@ from pathlib import Path
 
 from harness.loop import run_agent
 from harness.tools import Context
+from phases import AgentDispatchError
 
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,7 +21,7 @@ _CONTRACT_KEYS = ["api_endpoints", "shared_types", "db_tables", "env_vars", "dep
 _ENDPOINT_KEYS = ["method", "path", "request_schema", "response_schema"]
 
 
-class PlanFailed(Exception):
+class PlanFailed(AgentDispatchError):
     pass
 
 

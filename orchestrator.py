@@ -17,7 +17,7 @@ import signal
 import sys
 from pathlib import Path
 
-from phases import PHASE_FNS, VerifyFailed, real_agents
+from phases import PHASE_FNS, AgentDispatchError, VerifyFailed, real_agents
 from state import DONE, MAX_RETRIES, STATE_FILE, ProjectState
 
 
@@ -76,6 +76,17 @@ def run(prompt: str | None = None, agents: dict | None = None) -> int:
         print(f"[ECHARA] >>> {phase}")
         try:
             summary = PHASE_FNS[phase](state, build_dir, agents)
+        except AgentDispatchError as e:
+            # Every lane for this agent is down (rate limits, dead CLIs).
+            # Retrying immediately would hit the same dead lanes — stamp a
+            # clean failed verdict. State stays parked at this phase, so a
+            # later `python orchestrator.py` resumes exactly here.
+            state.verdict = f"failed: {phase} could not dispatch: {e}"
+            _stamp_failed(state, build_dir, str(e))
+            state.save()
+            print(f"[ECHARA] FAILED — {phase} dispatch: {e}\n"
+                  f"[ECHARA] state saved; re-run `python orchestrator.py` to resume.")
+            return 1
         except VerifyFailed as e:
             if state.retry_build(str(e)):
                 print(f"[ECHARA] VERIFY failed — retry {state.retry_count}/{MAX_RETRIES}, "

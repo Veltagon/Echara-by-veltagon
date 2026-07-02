@@ -12,11 +12,12 @@ from pathlib import Path
 
 from skills import router as skills_router
 from harness import skills as skills_stage
+from phases import AgentDispatchError
 
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
 
 
-class BuildDispatchFailed(Exception):
+class BuildDispatchFailed(AgentDispatchError):
     pass
 
 
@@ -36,6 +37,12 @@ _NN_RULES = """NON-NEGOTIABLE RULES (each one killed a real build when broken):
   relative dots across packages.
 - NN-BE-1: Every router you create is registered in main.py with include_router.
 - NN-BE-2: Exactly one SQLAlchemy Base, one metadata, defined once in app/db.py.
+- NN-DB-1: Never a cwd-relative database URL. `sqlite:///./app.db` opens a
+  different database per launch directory (stale-schema crashes in production).
+  Anchor it: DATABASE_URL = os.environ.get("DATABASE_URL",
+  f"sqlite:///{Path(__file__).resolve().parent.parent / 'app.db'}")
+- NN-DB-2: Never commit/leave a .db file in the source tree; the lifespan
+  creates the schema on boot.
 - Do not implement ANYTHING not in PLAN.md. No extra endpoints, no auth, no
   logging frameworks, no Docker.
 - Do not put everything in one file — follow the file manifest exactly.

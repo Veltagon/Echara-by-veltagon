@@ -83,7 +83,16 @@ def _parse_retry_after(stderr_text: str) -> float | None:
 
 class CodexProvider(Provider):
     name = "codex"
-    idle_limit_sec = 60  # codex emits intermediate reasoning every few seconds
+    # Was 60 ("codex emits reasoning every few seconds") — stale: with
+    # `reasoning effort: xhigh` + `reasoning summaries: none` (user's codex
+    # config) it can think SILENTLY for >60s and got idle-killed mid-build
+    # (2026-07-02, 67KB of healthy stderr then a long quiet stretch). 300s
+    # matches the claude calibration: true hangs still die in 5 minutes.
+    idle_limit_sec = 300
+    # codex on PATH is an npm .cmd shim → cmd.exe's 8,191-char argv ceiling.
+    # Prompts embedding PLAN.md + contract exceed it, so deliver via stdin
+    # (`codex exec -` reads the prompt from stdin; probe-verified).
+    stdin_prompt = True
 
     def build_argv(self, prompt: str, cwd: Path) -> list[str]:
         return [
@@ -92,7 +101,7 @@ class CodexProvider(Provider):
             "--cd", str(cwd.resolve()),
             "--skip-git-repo-check",
             "--dangerously-bypass-approvals-and-sandbox",
-            prompt,
+            "-",
         ]
 
     def run(

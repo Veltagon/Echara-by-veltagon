@@ -450,6 +450,28 @@ def repair_canonical_filenames(code_dir: Path) -> list[str]:
     return actions
 
 
+# --- scratch sqlite files shipped in the deliverable ----------------------------
+
+def repair_remove_scratch_db(code_dir: Path) -> list[str]:
+    """Builders run the app/tests mid-build and leave app.db behind. Shipping
+    it is a stale-schema time bomb: create_all only creates MISSING tables, so
+    a DB written before the final model shape breaks the delivered app (seen
+    live: 2026-07-02 projects+tasks eval, INSERT failed on a column the stale
+    table lacked). The lifespan rebuilds the schema on boot — scratch DBs are
+    never needed. Skips anything under tests/ (a deliberate fixture would live
+    there) and alembic dirs."""
+    if not _enabled("REMOVE_SCRATCH_DB"):
+        return []
+    root = _backend_root(code_dir)
+    actions = []
+    for pattern in ("*.db", "*.sqlite", "*.sqlite3"):
+        for f in list(root.glob(pattern)) + list((root / "app").glob(pattern) if (root / "app").is_dir() else []):
+            if f.is_file():
+                f.unlink()
+                actions.append(f"scratch-db: removed {f.relative_to(code_dir)}")
+    return actions
+
+
 # --- dispatcher + barriers ------------------------------------------------------
 
 REPAIRS = [
@@ -461,6 +483,7 @@ REPAIRS = [
     repair_test_migrations_capture_stderr,
     repair_missing_client_fixture,
     repair_health_endpoint_path,
+    repair_remove_scratch_db,
     repair_ruff_autofix,            # last — lint the final shape
 ]
 

@@ -11,9 +11,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-PHASES = ["INTAKE", "PLAN", "BUILD", "VERIFY", "DELIVER"]
+PHASES = ["INTAKE", "PLAN", "BUILD", "REPAIR", "VERIFY", "DELIVER"]
 DONE = "DONE"
 STATE_FILE = Path("PROJECT_STATE.json")
+MAX_RETRIES = 3
 
 
 @dataclass
@@ -25,6 +26,9 @@ class ProjectState:
     started_at: str = ""
     last_updated: str = ""
     verdict: str = ""
+    user_prompt: str = ""
+    retry_count: int = 0
+    last_error: str = ""  # exact verify failure fed back to Builder on retry
 
     @classmethod
     def new(cls) -> "ProjectState":
@@ -56,3 +60,14 @@ class ProjectState:
             self.completed_phases.append(phase)
         i = PHASES.index(phase)
         self.current_phase = PHASES[i + 1] if i + 1 < len(PHASES) else DONE
+
+    def retry_build(self, error: str) -> bool:
+        """VERIFY failed. If retries remain: record the exact error, rewind to
+        BUILD, return True. Retries exhausted: return False (caller stamps the
+        failed verdict)."""
+        if self.retry_count >= MAX_RETRIES:
+            return False
+        self.retry_count += 1
+        self.last_error = error
+        self.current_phase = "BUILD"
+        return True

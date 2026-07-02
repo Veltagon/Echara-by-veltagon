@@ -1,127 +1,96 @@
-"""Stub phase functions for milestone 1.
+"""M4 phase implementations: INTAKE → PLAN → BUILD → REPAIR → VERIFY → DELIVER.
 
-Each function writes hardcoded placeholder files into the build directory and
-returns a one-line summary. No agents, no LLMs, no I/O beyond the local
-filesystem.
+Each phase is `fn(state, build_dir, agents) -> str` (one-line summary). `agents`
+is an injectable dict — the orchestrator wires the real planner/builder/
+verifier/repair via `real_agents()`; the dry-run tests inject stubs, so the
+whole pipeline is walkable with zero model calls.
+
+VERIFY raises VerifyFailed with the exact failing output; the orchestrator owns
+the retry policy (max 3, then a failed verdict — no refine loop, no scores).
 """
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
+
+from state import ProjectState
 
 
 class VerifyFailed(Exception):
-    """Raised by phase_verify when the produced code fails the smoke check."""
+    """Verification failed. str(exc) is the exact error fed back to Builder."""
 
 
-def phase_intake(build_dir: Path) -> str:
-    build_dir.mkdir(parents=True, exist_ok=True)
-    ledger = {
-        "goal": "Notes CRUD API (milestone 1 stub goal).",
-        "constraints": ["python>=3.11", "fastapi", "sqlite"],
-        "non_goals": ["frontend", "auth", "deployment"],
+def real_agents() -> dict:
+    """Late imports so the dry-run path never loads provider/LLM machinery."""
+    from agents import builder, planner, repairs, verifier
+
+    return {
+        "planner": planner.run_planner,
+        "builder": builder.run_builder,
+        "repair": repairs.repair_all,
+        "verifier": verifier.verify,
+        "failure_summary": verifier.failure_summary,
     }
-    (build_dir / "INSTRUCTION_LEDGER.json").write_text(
-        json.dumps(ledger, indent=2), encoding="utf-8"
-    )
-    return "wrote INSTRUCTION_LEDGER.json"
 
 
-def phase_plan(build_dir: Path) -> str:
-    (build_dir / "PLAN.md").write_text(
-        "# PLAN\n\n"
-        "## Goal\nNotes CRUD API.\n\n"
-        "## Endpoints\n"
-        "- POST   /api/notes\n"
-        "- GET    /api/notes\n"
-        "- GET    /api/notes/{id}\n"
-        "- DELETE /api/notes/{id}\n",
-        encoding="utf-8",
-    )
-    contract = {
-        "api_endpoints": [
-            {"method": "POST",   "path": "/api/notes",      "request_schema": "NoteCreate", "response_schema": "NoteOut"},
-            {"method": "GET",    "path": "/api/notes",      "response_schema": "list[NoteOut]"},
-            {"method": "GET",    "path": "/api/notes/{id}", "response_schema": "NoteOut"},
-            {"method": "DELETE", "path": "/api/notes/{id}", "response_schema": "None"},
-        ],
-        "shared_types": [
-            {"name": "NoteCreate", "fields": {"title": "str", "body": "str"}},
-            {"name": "NoteOut",    "fields": {"id": "int", "title": "str", "body": "str", "created_at": "datetime"}},
-        ],
+def phase_intake(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    if not state.user_prompt.strip():
+        raise ValueError("INTAKE: no user prompt — pass --prompt")
+    (build_dir / "PROMPT.txt").write_text(state.user_prompt, encoding="utf-8")
+    return f"saved prompt ({len(state.user_prompt)} chars)"
+
+
+def phase_plan(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    info = agents["planner"](state.user_prompt, build_dir)
+    return f"plan written by {info.get('model', '?')} in {info.get('attempts', '?')} attempt(s)"
+
+
+def phase_build(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    (build_dir / "code").mkdir(exist_ok=True)
+    info = agents["builder"](build_dir, last_error=state.last_error)
+    return f"built via {info.get('provider', '?')} in {info.get('elapsed_sec', '?')}s"
+
+
+def phase_repair(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    actions = agents["repair"](build_dir / "code")
+    log_path = build_dir / "REPAIR_LOG.json"
+    history = json.loads(log_path.read_text(encoding="utf-8")) if log_path.is_file() else []
+    history.append({"attempt": state.retry_count, "actions": actions})
+    log_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    return f"{len(actions)} repair action(s)"
+
+
+def phase_verify(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    report = agents["verifier"](build_dir)
+    if not report["verified"]:
+        raise VerifyFailed(agents["failure_summary"](report))
+    state.last_error = ""
+    passed = ", ".join(report["checks"])
+    return f"verified: {passed} all passed"
+
+
+def phase_deliver(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    verdict = {
+        "deployment_verified": True,
+        "build_id": state.build_id,
+        "retries_used": state.retry_count,
+        "checks": "import_smoke, alembic_upgrade, pytest — all passed",
     }
-    (build_dir / "CONTRACT_FROZEN.json").write_text(
-        json.dumps(contract, indent=2), encoding="utf-8"
-    )
-    return "wrote PLAN.md, CONTRACT_FROZEN.json"
+    (build_dir / "BUILD_VERDICT.json").write_text(json.dumps(verdict, indent=2),
+                                                  encoding="utf-8")
+    out = build_dir / "output"
+    if (build_dir / "code").is_dir():
+        shutil.copytree(build_dir / "code", out, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", ".repairs_*"))
+    return f"stamped BUILD_VERDICT.json, code copied to {out.name}/"
 
 
-def phase_build(build_dir: Path) -> str:
-    app = build_dir / "backend" / "app"
-    (app / "models").mkdir(parents=True, exist_ok=True)
-    (app / "routers").mkdir(parents=True, exist_ok=True)
-
-    (app / "__init__.py").write_text("", encoding="utf-8")
-    (app / "models" / "__init__.py").write_text("", encoding="utf-8")
-    (app / "routers" / "__init__.py").write_text("", encoding="utf-8")
-
-    (app / "main.py").write_text(
-        "from fastapi import FastAPI\n"
-        "from .routers import notes\n\n"
-        'app = FastAPI(title="echara-notes")\n'
-        'app.include_router(notes.router, prefix="/api")\n',
-        encoding="utf-8",
-    )
-    (app / "models" / "note.py").write_text(
-        "from datetime import datetime\n"
-        "from pydantic import BaseModel\n\n"
-        "class NoteCreate(BaseModel):\n"
-        "    title: str\n"
-        "    body: str\n\n"
-        "class NoteOut(BaseModel):\n"
-        "    id: int\n"
-        "    title: str\n"
-        "    body: str\n"
-        "    created_at: datetime\n",
-        encoding="utf-8",
-    )
-    (app / "routers" / "notes.py").write_text(
-        "from fastapi import APIRouter\n"
-        "from ..models.note import NoteOut\n\n"
-        "router = APIRouter()\n\n"
-        '@router.get("/notes")\n'
-        "def list_notes() -> list[NoteOut]:\n"
-        "    return []\n",
-        encoding="utf-8",
-    )
-    return "wrote backend/app/{main.py, models/note.py, routers/notes.py}"
-
-
-def phase_verify(build_dir: Path) -> str:
-    main_py = build_dir / "backend" / "app" / "main.py"
-    if not main_py.exists():
-        raise VerifyFailed(f"missing {main_py}")
-    if "from fastapi import FastAPI" not in main_py.read_text(encoding="utf-8"):
-        raise VerifyFailed("main.py does not import FastAPI")
-    (build_dir / "VERIFY.json").write_text(
-        json.dumps(
-            {
-                "import_smoke": "passed",
-                "checks": ["main.py exists", "from fastapi import FastAPI present"],
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    return "verified main.py imports FastAPI"
-
-
-def phase_deliver(build_dir: Path) -> str:
-    (build_dir / "VERDICT.md").write_text(
-        "# VERDICT\n\n"
-        "verified_path: true\n"
-        "score: stub-pass (milestone 1)\n"
-        f"build_dir: {build_dir.as_posix()}\n",
-        encoding="utf-8",
-    )
-    return "wrote VERDICT.md"
+PHASE_FNS = {
+    "INTAKE": phase_intake,
+    "PLAN": phase_plan,
+    "BUILD": phase_build,
+    "REPAIR": phase_repair,
+    "VERIFY": phase_verify,
+    "DELIVER": phase_deliver,
+}

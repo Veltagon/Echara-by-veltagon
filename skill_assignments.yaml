@@ -1,0 +1,17 @@
+# Role -> skill assignments. Skill IDs are flat names under the pool root
+# (skills-pool/engineering-team/skills/<id>/SKILL.md). The spec's illustrative
+# paths (engineering/backend-development) do not exist in the real pool; these
+# are the closest real skills. See DECISIONS.md. Max 4 skills per role.
+
+planner:
+  - senior-architect
+  - senior-backend
+
+builder:
+  - senior-backend
+  - senior-data-engineer
+  - senior-devops
+
+verifier:
+  - senior-security
+  - code-reviewer

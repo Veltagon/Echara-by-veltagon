@@ -1,0 +1,25 @@
+# Secrets — NEVER commit. Live API keys live here; one push to a public
+# remote burns them all. See .env.example for the shape.
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ECHARA run artifacts
+builds/
+logs/
+PROJECT_STATE.json
+
+# Cloned skill pool (4.5k files) — re-clone via the command in DECISIONS.md
+skills-pool/
+.pytest_cache/
+
+# Local Claude Code preferences — user-specific, not project code
+.claude/
+# Outdated wind-down note; superseded by M2_5_OPENCODE_MAP.md
+M2_5_INPROGRESS.md

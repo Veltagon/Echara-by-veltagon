@@ -1,0 +1,30 @@
+# Provider routing config. API keys are read from environment variables
+# (${VAR} is resolved at load time) — never hardcode real keys here.
+# See DECISIONS.md for how this maps onto the existing M2 CLI providers.
+
+providers:
+  anthropic:
+    api_key: "${ANTHROPIC_API_KEY}"
+    model: "claude-sonnet-4-20250514"
+  chatgpt:
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-4o-mini"
+  openrouter:
+    api_key: "${OPENROUTER_API_KEY}"
+    model: "anthropic/claude-sonnet-4-20250514"
+  claude_code:
+    type: cli
+    command: "claude"
+  codex:
+    type: cli
+    command: "codex"
+
+role_assignment:
+  planner: "anthropic"
+  builder: "claude_code"
+  verifier: "chatgpt"
+
+fallback_order:
+  - anthropic
+  - chatgpt
+  - openrouter

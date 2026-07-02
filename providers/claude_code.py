@@ -16,10 +16,15 @@ CLAUDE_TEST_CONFIG_DIR = str(Path.home() / ".claude-test")
 
 class ClaudeCodeProvider(Provider):
     name = "claude"
-    # `claude -p text` only flushes the final text; tool calls during the
-    # session produce no stdout. 60s would false-positive on legitimate
-    # multi-tool rounds. 180s is the V1-calibrated safe ceiling.
-    idle_limit_sec = 180
+    # stream-json emits a JSONL event per tool call / message chunk, so the
+    # mtime-based idle watcher gets real liveness signal (verified: events
+    # flush to the log file incrementally, not in one burst at exit). The
+    # remaining silent window is a single long-running tool call (e.g. a cold
+    # `pip install`) between its tool_use and tool_result events — 300s covers
+    # that while still catching true hangs in 5 minutes. The old `text` format
+    # was silent until completion, so builds longer than the idle limit were
+    # killed even when healthy (M4 Test 3 run 1).
+    idle_limit_sec = 300
 
     def env(self) -> dict[str, str]:
         return {"CLAUDE_CONFIG_DIR": CLAUDE_TEST_CONFIG_DIR}
@@ -29,6 +34,8 @@ class ClaudeCodeProvider(Provider):
             "claude",
             "--dangerously-skip-permissions",
             "--print",
-            "--output-format", "text",
+            # stream-json requires --verbose in -p mode (CLI enforces it).
+            "--output-format", "stream-json",
+            "--verbose",
             prompt,
         ]

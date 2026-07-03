@@ -32,7 +32,9 @@ class ProjectState:
 
     @classmethod
     def new(cls) -> "ProjectState":
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Microsecond suffix: second-resolution IDs collide when two builds
+        # start back-to-back (eval chains do), silently sharing one build dir.
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         build_id = f"build_{ts}"
         now = datetime.now().isoformat(timespec="seconds")
         return cls(

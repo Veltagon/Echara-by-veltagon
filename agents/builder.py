@@ -43,8 +43,13 @@ _NN_RULES = """NON-NEGOTIABLE RULES (each one killed a real build when broken):
   f"sqlite:///{Path(__file__).resolve().parent.parent / 'app.db'}")
 - NN-DB-2: Never commit/leave a .db file in the source tree; the lifespan
   creates the schema on boot.
-- Do not implement ANYTHING not in PLAN.md. No extra endpoints, no auth, no
-  logging frameworks, no Docker.
+- NN-AUTH-1: For password hashing use the `bcrypt` library DIRECTLY
+  (bcrypt.hashpw/checkpw, truncate input to 72 bytes). Do NOT use passlib —
+  passlib 1.7.4 is unmaintained and crashes with modern bcrypt at backend
+  load. If you must use passlib, pin bcrypt==4.0.1 in requirements.txt.
+- Do not implement ANYTHING not in PLAN.md. No extra endpoints, no unrequested
+  auth, no logging frameworks, no Docker. (If the plan REQUIRES auth, implement
+  it exactly as specified.)
 - Do not put everything in one file — follow the file manifest exactly.
 - Self-verify: after writing each file, read it back; after writing all files run
   `python -c "from app.main import app"` from code/backend/ and run

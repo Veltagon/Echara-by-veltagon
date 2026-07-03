@@ -31,18 +31,24 @@ def _install_sigint_handler(state: ProjectState) -> None:
 
 
 def _bootstrap_state(prompt: str | None) -> ProjectState:
+    """--prompt given → ALWAYS a fresh build; resume only when prompt is None
+    (matches the documented CLI contract). The old behavior adopted the prompt
+    into an unfinished state, which silently re-verified a FAILED build's dead
+    code instead of building anew (auth eval run 3, 2026-07-03: a '13-second
+    build' that never built anything)."""
     state = ProjectState.load()
-    if state is None or state.current_phase == DONE:
-        if state is not None:
-            print(f"[ECHARA] previous build {state.build_id} finished — starting fresh")
+    if prompt is not None:
+        if state is not None and state.current_phase != DONE:
+            print(f"[ECHARA] abandoning unfinished build {state.build_id} "
+                  f"({state.verdict or 'in progress'}) — --prompt starts fresh")
         state = ProjectState.new()
-        state.user_prompt = prompt or ""
+        state.user_prompt = prompt
         print(f"[ECHARA] new build: {state.build_id}")
-    else:
-        print(f"[ECHARA] resuming {state.build_id} at phase {state.current_phase} "
-              f"(retry {state.retry_count}/{MAX_RETRIES})")
-        if prompt:
-            state.user_prompt = prompt
+        return state
+    if state is None or state.current_phase == DONE:
+        raise SystemExit("[ECHARA] nothing to resume — pass --prompt to start a build.")
+    print(f"[ECHARA] resuming {state.build_id} at phase {state.current_phase} "
+          f"(retry {state.retry_count}/{MAX_RETRIES})")
     return state
 
 

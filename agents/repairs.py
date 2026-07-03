@@ -450,6 +450,43 @@ def repair_canonical_filenames(code_dir: Path) -> list[str]:
     return actions
 
 
+# --- passlib + modern bcrypt incompatibility -------------------------------------
+
+def repair_passlib_bcrypt_compat(code_dir: Path) -> list[str]:
+    """passlib 1.7.4 (unmaintained) is broken with bcrypt >= 4.1: its backend
+    self-test crashes at load ('module bcrypt has no attribute __about__' /
+    'password cannot be longer than 72 bytes'), so EVERY hash call dies and the
+    error text misleads builders into truncating passwords instead of pinning.
+    Seen twice on 2026-07-03 (auth eval runs 1+2; run 2 burned all 3 retries on
+    it). If requirements pulls passlib, pin bcrypt==4.0.1 — the last release
+    passlib works with."""
+    if not _enabled("PASSLIB_BCRYPT_COMPAT"):
+        return []
+    reqs = _backend_root(code_dir) / "requirements.txt"
+    if not reqs.is_file():
+        return []
+    lines = reqs.read_text(encoding="utf-8").splitlines()
+    uses_passlib = any(re.match(r"\s*passlib", ln, re.IGNORECASE) for ln in lines)
+    if not uses_passlib:
+        return []
+    out, pinned, changed = [], False, False
+    for ln in lines:
+        if re.match(r"\s*bcrypt\s*$", ln):  # bare, unpinned
+            out.append("bcrypt==4.0.1")
+            pinned, changed = True, True
+        else:
+            out.append(ln)
+            if re.match(r"\s*bcrypt[=<>!]", ln):
+                pinned = True  # already pinned somehow — leave it
+    if not pinned:  # passlib[bcrypt] pulls bcrypt transitively — pin explicitly
+        out.append("bcrypt==4.0.1")
+        changed = True
+    if not changed:
+        return []
+    reqs.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return ["passlib-compat: pinned bcrypt==4.0.1 in requirements.txt"]
+
+
 # --- scratch sqlite files shipped in the deliverable ----------------------------
 
 def repair_remove_scratch_db(code_dir: Path) -> list[str]:
@@ -476,6 +513,7 @@ def repair_remove_scratch_db(code_dir: Path) -> list[str]:
 
 REPAIRS = [
     repair_canonical_filenames,     # filenames first — later repairs read them
+    repair_passlib_bcrypt_compat,   # before verify provisions the venv
     repair_alembic_scaffold,
     repair_alembic_migration_chain,
     repair_fastapi_validation_loc_shape,

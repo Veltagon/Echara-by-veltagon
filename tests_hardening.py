@@ -62,6 +62,27 @@ def test_rate_limit_parser() -> None:
         got = _parse_retry_after(text)
         _record(f"parse '{text[:35]}...' -> {expected}", got == expected, f"got={got}")
 
+    # Regression: 400KB of echoed generated code containing "rate limiting"
+    # docs mid-stream must NOT match (benched a healthy codex for 4.7 days).
+    poison = (
+        "diff output...\n**Add rate limiting**\n```typescript\n"
+        "import rateLimit from 'express-rate-limit';\n"
+        "const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });\n"
+        "```\n" + "x = 1\n" * 3000 +
+        "retry logic discussed above uses exponential backoff of 404171 steps\n"
+        + "y = 2\n" * 500 + "tokens used\n67,504\n"
+    )
+    _record("echoed code with 'rate limiting' mid-stream -> None",
+            _parse_retry_after(poison) is None,
+            f"got={_parse_retry_after(poison)}")
+    # A REAL terminal rate-limit message (at the end) still parses.
+    real = "z = 3\n" * 5000 + "\nERROR: rate limit exceeded, try again in 120s\n"
+    _record("terminal rate-limit after long transcript -> 120",
+            _parse_retry_after(real) == 120.0)
+    # Implausible retry-after (>24h) is rejected.
+    _record("implausible 404171s -> None",
+            _parse_retry_after("rate limit: retry after 404171 s") is None)
+
 
 # ---------------------------------------------------------------------------
 # 3. Availability registry
@@ -214,6 +235,34 @@ def test_idle_watcher() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 6. stdin prompt delivery (Windows argv-length fix)
+# ---------------------------------------------------------------------------
+
+class _StdinEchoProvider(Provider):
+    """Echoes stdin back to stdout — proves the prompt arrives via the pipe."""
+    name = "fakestdin"
+    idle_limit_sec = 30
+    stdin_prompt = True
+
+    def build_argv(self, prompt: str, cwd: Path) -> list[str]:
+        return [sys.executable, "-c", "import sys; print(sys.stdin.read())"]
+
+
+def test_stdin_prompt_delivery() -> None:
+    print("\n>>> stdin prompt delivery")
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    # 20KB prompt — far past cmd.exe's 8,191-char argv ceiling that broke the
+    # codex .cmd shim ("The command line is too long.", 2026-07-02).
+    prompt = "NN-RULE " * 2500 + "END-MARKER"
+    provider = _StdinEchoProvider()
+    result = provider.run(prompt, SCRATCH / "stdin", SCRATCH, timeout_sec=30)
+    _record("stdin run exits 0", result.exit_code == 0, f"exit={result.exit_code}")
+    out = result.stdout_path.read_text(encoding="utf-8", errors="replace")
+    _record("full 20KB prompt arrived via stdin",
+            "END-MARKER" in out and out.count("NN-RULE") == 2500)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -224,6 +273,7 @@ def main() -> int:
     test_availability()
     test_slot_gate()
     test_idle_watcher()
+    test_stdin_prompt_delivery()
     failed = [n for n, ok, _ in _results if not ok]
     print()
     print(f"  {len(_results) - len(failed)} passed, {len(failed)} failed")

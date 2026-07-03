@@ -25,6 +25,10 @@ class ClaudeCodeProvider(Provider):
     # was silent until completion, so builds longer than the idle limit were
     # killed even when healthy (M4 Test 3 run 1).
     idle_limit_sec = 300
+    # Prompt via stdin (probe-verified: `echo ... | claude -p` works). Wave
+    # builds embed 40-file plans — argv would hit the ~32K CreateProcess
+    # ceiling the codex .cmd shim already hit at 8K.
+    stdin_prompt = True
 
     def env(self) -> dict[str, str]:
         return {"CLAUDE_CONFIG_DIR": CLAUDE_TEST_CONFIG_DIR}
@@ -37,5 +41,4 @@ class ClaudeCodeProvider(Provider):
             # stream-json requires --verbose in -p mode (CLI enforces it).
             "--output-format", "stream-json",
             "--verbose",
-            prompt,
         ]

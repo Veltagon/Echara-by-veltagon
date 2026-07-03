@@ -34,13 +34,22 @@ _LONG_BACKOFF_THRESHOLD_SEC = 300.0  # >=5min → exhausted; not worth retrying
 
 # Codex rate-limit message shapes — kept loose because the exact format has
 # changed across versions. The captured group is the retry-after in seconds.
+# NOT DOTALL: codex echoes generated code and skill files to stderr, and a
+# DOTALL `rate.?limit.*?retry.*?(\d+)s` once matched an express-rate-limit
+# example inside echoed SKILL.md content and benched a healthy codex for 4.7
+# days (2026-07-03 depth build). Matches must stay line-local.
 _RATE_LIMIT_PATTERNS: list[re.Pattern] = [
-    re.compile(r"rate.?limit.*?(?:try again|retry).*?(\d+)\s*s", re.IGNORECASE | re.DOTALL),
+    re.compile(r"rate.?limit.*?(?:try again|retry).*?(\d+)\s*s", re.IGNORECASE),
     re.compile(r"try again in\s*(\d+)\s*s", re.IGNORECASE),
     re.compile(r"retry[- ]after[^\d]*(\d+)", re.IGNORECASE),
     re.compile(r"please wait\s*(\d+)\s*seconds", re.IGNORECASE),
     re.compile(r"too many requests.*?(\d+)\s*s", re.IGNORECASE),
 ]
+
+# Real rate-limit errors are terminal messages — scan only the stderr tail so
+# a 400KB session transcript can't produce accidental matches mid-stream.
+_STDERR_TAIL_CHARS = 2000
+_MAX_PLAUSIBLE_RETRY_SEC = 24 * 3600.0
 
 
 def _acquire_slot(timeout_sec: float = _ACQUIRE_TIMEOUT_SEC) -> bool:
@@ -71,13 +80,16 @@ def _release_slot() -> None:
 
 
 def _parse_retry_after(stderr_text: str) -> float | None:
+    tail = stderr_text[-_STDERR_TAIL_CHARS:]
     for pat in _RATE_LIMIT_PATTERNS:
-        m = pat.search(stderr_text)
+        m = pat.search(tail)
         if m:
             try:
-                return float(m.group(1))
+                val = float(m.group(1))
             except (ValueError, IndexError):
                 continue
+            if 0 < val <= _MAX_PLAUSIBLE_RETRY_SEC:
+                return val
     return None
 
 

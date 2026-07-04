@@ -15,6 +15,7 @@ waves; burning 90s per wave re-proving it is waste).
 from __future__ import annotations
 
 import json
+import os
 import py_compile
 import re
 import time
@@ -290,33 +291,57 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         if (staged / "senior-backend" / "SKILL.md").is_file():
             skill_rel = "skills/senior-backend"
 
-    dead: set[str] = set()  # lanes that hard-failed this build — don't retry per wave
     used: list[str] = []
     started = time.monotonic()
+    consec = {"claude": 0, "codex": 0}  # consecutive failures per lane this build
+    wait_budget = [8 * 3600.0]          # seconds we may still park (M5 cap)
+    _WAVE_MODEL = os.environ.get("ECHARA_WAVE_MODEL", "sonnet")  # tiering default
+    _WAIT = os.environ.get("ECHARA_WAIT_ON_EXHAUST") == "1"
 
-    def dispatch(label: str, prompt: str) -> None:
-        """Run one wave/pass on the first live lane; record forensics per pass
-        (fixes #11 — no more single overwritten BUILDER_PROMPT.md)."""
+    def dispatch(label: str, prompt: str, model: str | None = None) -> None:
+        """Run one pass on the first live lane. A lane is dead only after
+        DEAD_AFTER consecutive failures (#9 — a single idle blip is a 60s
+        cooldown, not permadeath). When all lanes are exhausted with a known
+        reset and ECHARA_WAIT_ON_EXHAUST=1, park until the earliest reset (#10)."""
         from providers import PROVIDERS, availability
         (build_dir / f"BUILDER_PROMPT_{_slug(label)}.md").write_text(prompt, encoding="utf-8")
-        failures = []
-        for name in ("claude", "codex"):
-            if name in dead:
-                continue
-            if not availability.is_available(name):
-                failures.append(f"{name}: on cooldown")
-                continue
-            log(f"builder: {label} -> {name}")
-            result = PROVIDERS[name]().run(prompt, build_dir, ECHARA_ROOT / "logs",
-                                           timeout_sec=1500)
-            if result.ok:
-                used.append(name)
-                return
-            dead.add(name)
-            failures.append(f"{name}: exit={result.exit_code} kill={result.kill_reason} "
-                            f"skip={result.skipped_reason}")
-            log(f"builder: {failures[-1]} — lane dead for this build")
-        raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
+        DEAD_AFTER = 3
+        while True:
+            failures = []
+            for name in ("claude", "codex"):  # codex = spot-fix fallback lane
+                if consec[name] >= DEAD_AFTER:
+                    failures.append(f"{name}: dead ({DEAD_AFTER} consecutive)")
+                    continue
+                avail = availability.status(name)
+                if not avail.available:
+                    failures.append(f"{name}: cooldown {int(avail.seconds_until_reset)}s")
+                    continue
+                tag = f" ({model})" if name == "claude" and model else ""
+                log(f"builder: {label} -> {name}{tag}")
+                prov = PROVIDERS[name](model=model) if name == "claude" else PROVIDERS[name]()
+                result = prov.run(prompt, build_dir, ECHARA_ROOT / "logs", timeout_sec=1500)
+                if result.ok:
+                    consec[name] = 0
+                    used.append(name)
+                    return
+                consec[name] += 1
+                # Provider already marked a real quota reset; a plain blip (idle
+                # kill / exit 1) gets a short cooldown so the NEXT pass retries it.
+                if not result.rate_limit_retry_after_sec:
+                    availability.mark_exhausted(name, time.time() + 60)
+                failures.append(f"{name}: exit={result.exit_code} kill={result.kill_reason}")
+                log(f"builder: {failures[-1]} (consec={consec[name]})")
+            if _WAIT:
+                resets = [availability.status(n).resets_at for n in ("claude", "codex")
+                          if consec[n] < DEAD_AFTER and availability.status(n).resets_at]
+                if resets:
+                    wait = min(resets) - time.time()
+                    if 0 < wait <= wait_budget[0]:
+                        log(f"builder: all lanes exhausted — parking {int(wait)}s until reset")
+                        time.sleep(wait + 5)
+                        wait_budget[0] -= wait
+                        continue
+            raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
 
     def build_module(mname: str, module_dir: Path, plan_md: str, ctx_fn, prog: dict) -> int:
         """Wave over one module's files with per-wave gate + interface regen."""
@@ -330,14 +355,14 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                 log(f"builder: {mname} wave {i + 1}/{len(chunks)} on disk — skipped")
                 continue
             label = f"{mname} w{i + 1}/{len(chunks)}"
-            dispatch(label, _wave_prompt(i + 1, len(chunks), chunk, ctx_fn()))
+            dispatch(label, _wave_prompt(i + 1, len(chunks), chunk, ctx_fn()), model=_WAVE_MODEL)
             interfaces.write_module_interface(build_dir, mname, module_dir)
             errors = _wave_gate(build_dir, chunk)
             if errors:
                 log(f"builder: {label} gate — {len(errors)} issue(s)")
                 if progress.can_fix(prog):
                     progress.record_fix(build_dir, prog, mname, "gate")  # persist BEFORE dispatch
-                    dispatch(f"{label} gate-fix", _gate_fix_prompt(errors, ctx_fn()))
+                    dispatch(f"{label} gate-fix", _gate_fix_prompt(errors, ctx_fn()), model="opus")
                     interfaces.write_module_interface(build_dir, mname, module_dir)
                 else:
                     log("builder: global fix budget exhausted — VERIFY will catch it")
@@ -371,21 +396,21 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                 progress.record_fix(build_dir, prog, mname, "integration")
                 err = "\n".join(f"{x['file']}::{x['test']}: {x['message']}" for x in fails)
                 ctx = _module_context(build_dir, modules[mname], seams, conv, "", skill_rel)
-                dispatch(f"{mname} fix", _fix_prompt(err, ctx))
+                dispatch(f"{mname} fix", _fix_prompt(err, ctx), model="opus")
                 interfaces.write_module_interface(build_dir, mname, build_dir / modules[mname]["path_root"])
                 n_passes += 1
             progress.save(build_dir, prog)
         else:
             # Unrouted (e.g. import-smoke or shared conftest) — one whole-build fix.
             allmods = {"name": "__all__", "depends_on": list(modules)}
-            dispatch("fix", _fix_prompt(last_error, _module_context(build_dir, allmods, seams, conv, "", skill_rel)))
+            dispatch("fix", _fix_prompt(last_error, _module_context(build_dir, allmods, seams, conv, "", skill_rel)), model="opus")
             n_passes = 1
     elif last_error:
         plan_md = _read_text(build_dir / "PLAN.md")
         contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"
         fix_ctx = _wave_context(build_dir, _DEFAULT_MODULE, [], plan_md, contract,
                                 skill_rel, progress.journal_tail(build_dir))
-        dispatch("fix", _fix_prompt(last_error, fix_ctx))
+        dispatch("fix", _fix_prompt(last_error, fix_ctx), model="opus")
         n_passes = 1
     elif is_multi:
         from agents import architect
@@ -413,7 +438,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                 progress.record_fix(build_dir, prog, mname, "integration")
                 test_rel = _module_prefix(m["path_root"]).replace(".", "/") + "/tests"
                 dispatch(f"{mname} integrate",
-                         _module_integration_prompt(mname, test_rel, ctx_fn()))
+                         _module_integration_prompt(mname, test_rel, ctx_fn()), model="opus")
                 interfaces.write_module_interface(build_dir, mname, mroot)
                 pm["integrated"] = True
                 n_passes += 1
@@ -423,7 +448,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             if mism and pm.get("seam_fixes", 0) < 1 and progress.can_fix(prog):
                 progress.record_fix(build_dir, prog, mname, "seam")
                 dispatch(f"{mname} seam-fix",
-                         _fix_prompt("Declared exports missing:\n" + "\n".join(mism), ctx_fn()))
+                         _fix_prompt("Declared exports missing:\n" + "\n".join(mism), ctx_fn()), model="opus")
                 interfaces.write_module_interface(build_dir, mname, mroot)
                 n_passes += 1
             pm["seams_ok"] = not interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
@@ -439,7 +464,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                                  skill_rel, progress.journal_tail(build_dir))
 
         n_passes = build_module(_DEFAULT_MODULE, build_dir / "code", plan_md, ctx_fn, prog)
-        dispatch("integration", _integration_prompt(ctx_fn()))
+        dispatch("integration", _integration_prompt(ctx_fn()), model="opus")
         n_passes += 1
 
     return {"provider": "+".join(sorted(set(used))) or "none", "waves": n_passes,

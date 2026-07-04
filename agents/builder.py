@@ -91,12 +91,15 @@ _NN_RULES = """NON-NEGOTIABLE RULES (each one killed a real build when broken):
 
 def _implementation_order(plan_md: str) -> list[str]:
     """File paths from the '## Implementation order' numbered list (fallback:
-    every code/backend path in the manifest, in order of appearance)."""
+    every code/ path in the manifest). Matches BOTH code/backend/... and
+    code/frontend/... — the latter is why frontend modules produced empty lists
+    before (E1, 2026-07-05)."""
     section = re.split(r"(?mi)^##\s*Implementation order.*$", plan_md)
     text = section[1] if len(section) > 1 else plan_md
-    files = re.findall(r"(?m)^\s*(?:\d+\.|\-)\s*`?(code/backend/\S+?)`?(?:\s+—.*|\s+-\s.*)?$", text)
+    files = re.findall(r"(?m)^\s*(?:\d+\.|\-)\s*`?(code/\S+?)`?(?:\s+—.*|\s+-\s.*)?$", text)
     if len(files) < 5:
-        files = re.findall(r"`?(code/backend/[\w/.\-]+)`?", plan_md)
+        # require a file extension so bare directory mentions don't match
+        files = re.findall(r"`?(code/[\w/.\-]+\.\w+)`?", plan_md)
     seen, out = set(), []
     for f in files:
         f = f.rstrip("`.,:;")

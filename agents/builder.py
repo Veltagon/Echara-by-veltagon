@@ -194,6 +194,42 @@ def _fix_prompt(last_error: str, ctx: str) -> str:
         f"{ctx}")
 
 
+def _module_integration_prompt(mname: str, test_rel: str, ctx: str) -> str:
+    return (
+        f"TASK: Integration pass for module '{mname}'. Its files and tests exist. "
+        f"From code/backend run `python -m pytest {test_rel} -q` and fix EVERY "
+        "failure in THIS module — imports, wiring, fixtures, test bugs — until "
+        "clean. Do not touch other modules; do not add features; do not delete "
+        "tests. Do not narrate.\n\n"
+        f"{ctx}")
+
+
+def _module_prefix(path_root: str) -> str:
+    """path_root 'code/backend/app/users' -> import prefix 'app.users' (junit
+    classname prefix for routing failures back to their module)."""
+    return path_root.replace("code/backend/", "").strip("/").replace("/", ".")
+
+
+def _failing_modules(build_dir: Path) -> dict[str, list[dict]]:
+    """Route VERIFICATION_REPORT.json's structured pytest failures to owning
+    modules by longest junit-classname prefix. {} when single-module or no data.
+    '__unrouted__' collects failures no module claims (e.g. top-level conftest)."""
+    if not (build_dir / "MODULES.json").is_file():
+        return {}
+    report = _read_json(build_dir / "VERIFICATION_REPORT.json", {})
+    failures = report.get("checks", {}).get("pytest", {}).get("failures", [])
+    from agents import architect
+    prefixes = {m["name"]: _module_prefix(m["path_root"])
+                for m in architect.load_modules(build_dir)}
+    routed: dict[str, list[dict]] = {}
+    for f in failures:
+        cls = f.get("file", "")
+        owner = next((n for n, p in sorted(prefixes.items(), key=lambda kv: -len(kv[1]))
+                      if p and cls.startswith(p)), "__unrouted__")
+        routed.setdefault(owner, []).append(f)
+    return routed
+
+
 def _module_context(build_dir: Path, module: dict, seams: dict, conventions: str,
                     module_plan: str, skill_rel: str | None) -> str:
     """Flat, per-MODULE context (M5): CONVENTIONS + only the seams of THIS
@@ -316,19 +352,39 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
     prog = progress.load(build_dir)
     is_multi = (build_dir / "MODULES.json").is_file()
 
-    if last_error:
-        # Fix pass — one context. Phase D routes per-module; for now, one shot.
-        if is_multi:
-            from agents import architect
-            seams = _read_json(build_dir / "SEAMS.json", {})
-            conv = _read_text(build_dir / "CONVENTIONS.md")
-            allmods = {"name": "__all__", "depends_on": list(m["name"] for m in architect.load_modules(build_dir))}
-            fix_ctx = _module_context(build_dir, allmods, seams, conv, "", skill_rel)
+    if last_error and is_multi:
+        # Route the failure per-module (from junitxml) and fix each owner in its
+        # own scoped context — lifetime budget ≤2 integration-fixes/module.
+        from agents import architect
+        seams = _read_json(build_dir / "SEAMS.json", {})
+        conv = _read_text(build_dir / "CONVENTIONS.md")
+        modules = {m["name"]: m for m in architect.load_modules(build_dir)}
+        routed = _failing_modules(build_dir)
+        real = {k: v for k, v in routed.items() if k in modules}
+        n_passes = 0
+        if real:
+            for mname, fails in real.items():
+                pm = progress.module_state(prog, mname)
+                if pm.get("integration_fixes", 0) >= 2 or not progress.can_fix(prog):
+                    log(f"builder: {mname} integration-fix budget spent — skip")
+                    continue
+                progress.record_fix(build_dir, prog, mname, "integration")
+                err = "\n".join(f"{x['file']}::{x['test']}: {x['message']}" for x in fails)
+                ctx = _module_context(build_dir, modules[mname], seams, conv, "", skill_rel)
+                dispatch(f"{mname} fix", _fix_prompt(err, ctx))
+                interfaces.write_module_interface(build_dir, mname, build_dir / modules[mname]["path_root"])
+                n_passes += 1
+            progress.save(build_dir, prog)
         else:
-            plan_md = _read_text(build_dir / "PLAN.md")
-            contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"
-            fix_ctx = _wave_context(build_dir, _DEFAULT_MODULE, [], plan_md, contract,
-                                    skill_rel, progress.journal_tail(build_dir))
+            # Unrouted (e.g. import-smoke or shared conftest) — one whole-build fix.
+            allmods = {"name": "__all__", "depends_on": list(modules)}
+            dispatch("fix", _fix_prompt(last_error, _module_context(build_dir, allmods, seams, conv, "", skill_rel)))
+            n_passes = 1
+    elif last_error:
+        plan_md = _read_text(build_dir / "PLAN.md")
+        contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"
+        fix_ctx = _wave_context(build_dir, _DEFAULT_MODULE, [], plan_md, contract,
+                                skill_rel, progress.journal_tail(build_dir))
         dispatch("fix", _fix_prompt(last_error, fix_ctx))
         n_passes = 1
     elif is_multi:
@@ -339,6 +395,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         n_passes = 0
         for mname in architect.module_order(build_dir):  # deps first
             m = modules[mname]
+            mroot = build_dir / m["path_root"]
             plan_path = build_dir / f"PLAN_{mname}.md"
             if not plan_path.is_file():
                 raise BuildDispatchFailed(f"module {mname}: PLAN_{mname}.md missing")
@@ -347,13 +404,32 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             def ctx_fn(m=m, plan_md=plan_md):
                 return _module_context(build_dir, m, seams, conventions, plan_md, skill_rel)
 
-            n_passes += build_module(mname, build_dir / m["path_root"], plan_md, ctx_fn, prog)
-        # Phase C: one final integration pass (Phase D replaces with per-module).
-        integ_ctx = _module_context(
-            build_dir, {"name": "__all__", "depends_on": list(modules)},
-            seams, conventions, "", skill_rel)
-        dispatch("integration", _integration_prompt(integ_ctx))
-        n_passes += 1
+            n_passes += build_module(mname, mroot, plan_md, ctx_fn, prog)
+            pm = progress.module_state(prog, mname)
+
+            # Per-module integration (scoped to this module's tests) — replaces
+            # the single 30k-codebase integration session (#3). Budget ≤2/module.
+            if (mroot / "tests").is_dir() and not pm.get("integrated") and progress.can_fix(prog):
+                progress.record_fix(build_dir, prog, mname, "integration")
+                test_rel = _module_prefix(m["path_root"]).replace(".", "/") + "/tests"
+                dispatch(f"{mname} integrate",
+                         _module_integration_prompt(mname, test_rel, ctx_fn()))
+                interfaces.write_module_interface(build_dir, mname, mroot)
+                pm["integrated"] = True
+                n_passes += 1
+
+            # Deterministic seam check + ≤1 seam-fix/module.
+            mism = interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
+            if mism and pm.get("seam_fixes", 0) < 1 and progress.can_fix(prog):
+                progress.record_fix(build_dir, prog, mname, "seam")
+                dispatch(f"{mname} seam-fix",
+                         _fix_prompt("Declared exports missing:\n" + "\n".join(mism), ctx_fn()))
+                interfaces.write_module_interface(build_dir, mname, mroot)
+                n_passes += 1
+            pm["seams_ok"] = not interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
+            progress.save(build_dir, prog)
+        # No final global integration — VERIFY is the cross-module gate; failures
+        # route back per-module on retry.
     else:
         plan_md = _read_text(build_dir / "PLAN.md")
         contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"

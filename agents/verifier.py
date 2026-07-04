@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from agents.repairs import _backend_root, _wait_for_repair_barrier
@@ -121,27 +122,70 @@ def _check_alembic(py: str, backend: Path, build_dir: Path) -> dict:
     return {"passed": ok, "detail": detail, "elapsed_sec": elapsed}
 
 
-def _check_pytest(py: str, backend: Path, code_dir: Path) -> dict:
-    tests = backend / "tests"
-    if not tests.is_dir():
-        return {"passed": False, "elapsed_sec": 0.0,
-                "detail": "no tests/ directory — the plan requires tests and none were written"}
+def _test_files(backend: Path) -> list[Path]:
+    return [f for f in backend.rglob("test_*.py") if "__pycache__" not in f.parts]
+
+
+def _count_tests(files: list[Path]) -> int:
+    n = 0
+    for f in files:
+        try:
+            n += f.read_text(encoding="utf-8", errors="replace").count("def test_")
+        except OSError:
+            pass
+    return n
+
+
+def _parse_junit(xml_path: Path) -> list[dict]:
+    """Structured per-test failures from junitxml (fixes #8: at 600 tests the
+    800-char stdout tail is summary counters, not tracebacks — routing needs
+    real per-test data). classname is the dotted module path -> maps to a file."""
+    if not xml_path.is_file():
+        return []
+    try:
+        root = ET.parse(xml_path).getroot()
+    except ET.ParseError:
+        return []
+    fails = []
+    for tc in root.iter("testcase"):
+        fe = tc.find("failure")
+        if fe is None:
+            fe = tc.find("error")
+        if fe is not None:
+            msg = (fe.get("message", "") or (fe.text or "")).strip()
+            fails.append({"file": tc.get("classname", ""), "test": tc.get("name", ""),
+                          "message": msg[:400]})
+    return fails
+
+
+def _check_pytest(py: str, backend: Path, code_dir: Path, build_dir: Path) -> dict:
+    files = _test_files(backend)  # recursive — multi-module tests live per-module
+    if not files:
+        return {"passed": False, "elapsed_sec": 0.0, "failures": [],
+                "detail": "no test files — the plan requires tests and none were written"}
     ignores, notes = [], []
-    for f in sorted(tests.glob("test_*.py")):
+    for f in files:
         try:
             py_compile.compile(str(f), doraise=True)
         except py_compile.PyCompileError as e:
             ignores += [f"--ignore={f}"]
             notes.append(f"py_compile skip {f.name}: {str(e)[:120]}")
     _wait_for_repair_barrier(code_dir)  # never pytest against half-fsynced files
+    n_tests = _count_tests(files)
+    timeout = min(1800, 60 + 2 * n_tests)  # #7: real bcrypt × auth matrix is slow
+    junit = build_dir / "verify_junit.xml"
+    junit.unlink(missing_ok=True)
     ok, detail, elapsed = _run(
-        [py, "-m", "pytest", "tests/", "-q", "--tb=short", *ignores], backend, 300)
+        [py, "-m", "pytest", "-q", "--tb=short", f"--junitxml={junit}", *ignores],
+        backend, timeout)
+    failures = _parse_junit(junit)
     if "no tests ran" in detail or "[exit 5]" in detail:
         ok = False
         detail = "no tests collected — " + detail
     if notes:
         detail = "; ".join(notes) + "\n" + detail
-    return {"passed": ok, "detail": detail, "elapsed_sec": elapsed}
+    return {"passed": ok, "detail": detail, "elapsed_sec": elapsed,
+            "n_tests": n_tests, "failures": failures}
 
 
 def verify(build_dir: Path) -> dict:
@@ -156,7 +200,7 @@ def verify(build_dir: Path) -> dict:
         _check_alembic(py, backend, build_dir) if checks["import_smoke"]["passed"]
         else {"passed": False, "detail": "skipped: import smoke failed", "elapsed_sec": 0.0})
     checks["pytest"] = (
-        _check_pytest(py, backend, code_dir) if checks["import_smoke"]["passed"]
+        _check_pytest(py, backend, code_dir, build_dir) if checks["import_smoke"]["passed"]
         else {"passed": False, "detail": "skipped: import smoke failed", "elapsed_sec": 0.0})
 
     report = {

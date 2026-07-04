@@ -116,11 +116,16 @@ def phase_deliver(state: ProjectState, build_dir: Path, agents: dict) -> str:
     }
     (build_dir / "BUILD_VERDICT.json").write_text(json.dumps(verdict, indent=2),
                                                   encoding="utf-8")
+    # Human gate 2: the delivery report (LLM-free, disk-derived).
+    from agents import report
+    (build_dir / "DELIVERY_REPORT.md").write_text(
+        report.delivery_report(build_dir), encoding="utf-8")
     out = build_dir / "output"
     if (build_dir / "code").is_dir():
         shutil.copytree(build_dir / "code", out, dirs_exist_ok=True,
-                        ignore=shutil.ignore_patterns("__pycache__", ".repairs_*"))
-    return f"stamped BUILD_VERDICT.json, code copied to {out.name}/"
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", ".repairs_*", "node_modules"))
+    return f"stamped BUILD_VERDICT.json + DELIVERY_REPORT.md, code copied to {out.name}/"
 
 
 PHASE_FNS = {

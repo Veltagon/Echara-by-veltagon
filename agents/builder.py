@@ -334,6 +334,9 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                 log(f"builder: {label} -> {name}{tag}")
                 prov = PROVIDERS[name](model=model) if name == "claude" else PROVIDERS[name]()
                 result = prov.run(prompt, build_dir, ECHARA_ROOT / "logs", timeout_sec=1500)
+                progress.metric_append(build_dir, {
+                    "label": label, "lane": name, "model": model or "default",
+                    "elapsed_sec": result.elapsed_sec, "outcome": "ok" if result.ok else "fail"})
                 if result.ok:
                     consec[name] = 0
                     used.append(name)

@@ -14,6 +14,7 @@ from pathlib import Path
 
 _PROGRESS = "BUILD_PROGRESS.json"
 _JOURNAL = "BUILD_JOURNAL.md"
+_METRICS = "BUILD_METRICS.json"
 
 # Ceiling on fix dispatches across the whole build — the backstop against the
 # retry-multiplication worst case (M5 plan risk #4). Exhausted → the normal
@@ -65,3 +66,27 @@ def journal_tail(build_dir: Path, n: int = 30) -> str:
     if not p.is_file():
         return ""
     return "\n".join(p.read_text(encoding="utf-8", errors="replace").splitlines()[-n:])
+
+
+def metric_append(build_dir: Path, entry: dict) -> None:
+    """Append one per-session record (lane/model/duration/outcome) for tuning
+    and the delivery report."""
+    p = Path(build_dir) / _METRICS
+    data = []
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = []
+    data.append(entry)
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def metrics(build_dir: Path) -> list[dict]:
+    p = Path(build_dir) / _METRICS
+    if not p.is_file():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []

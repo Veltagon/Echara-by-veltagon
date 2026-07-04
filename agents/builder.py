@@ -39,6 +39,11 @@ _NN_RULES = """NON-NEGOTIABLE RULES (each one killed a real build when broken):
 - NN-3: CORS is never wildcard origins together with allow_credentials=True.
 - NN-5: requirements.txt covers EVERY non-stdlib import you write. Missing dep =
   failed import smoke = failed build.
+- NN-DEP-1: The runtime is a very recent Python. Do NOT hard-pin old exact
+  versions of Rust-backed packages (pydantic, cryptography, bcrypt) that may
+  lack a wheel for it — pip would try a source build and fail. Prefer a
+  compatible floor (e.g. `pydantic>=2.9`) or a version known to ship wheels
+  for the current Python. When unsure, leave it unpinned.
 - NN-IMPORT-1: Verify an import target exists before writing the import.
 - NN-IMPORT-3: No circular imports. db.py must not import from routers; models
   must not import from main.

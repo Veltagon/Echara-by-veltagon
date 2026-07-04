@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import py_compile
+import shutil
 import subprocess
 import sys
 import time
@@ -59,27 +60,47 @@ def _run(argv: list[str], cwd: Path, timeout: int) -> tuple[bool, str, float]:
 def _provision_venv(build_dir: Path, backend: Path) -> tuple[str, str]:
     """(python_path, note). Venv at build_dir/.verify_venv with the project's
     requirements.txt + the verify toolchain. Re-provisions when requirements
-    change (Builder retries can edit it). Any provisioning failure falls back
-    to the orchestrator's interpreter so verification still runs."""
+    change (Builder retries can edit it).
+
+    A killed process can leave a corrupt half-venv (python present but pip
+    broken); the first `pip install` then fails and — before this — we silently
+    fell back to the orchestrator interpreter, verifying against ITS deps
+    instead of the project's pinned ones (seen 2026-07-04). So on the first
+    failure we wipe the venv and rebuild ONCE from scratch; only if that also
+    fails do we fall back so verification still runs."""
     venv = build_dir / ".verify_venv"
     py = venv / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     reqs = backend / "requirements.txt"
     reqs_text = reqs.read_text(encoding="utf-8", errors="replace") if reqs.is_file() else ""
     stamp = venv / ".reqs_stamp"
-    try:
-        if not py.exists():
-            subprocess.run([sys.executable, "-m", "venv", str(venv)],
-                           check=True, capture_output=True, timeout=120)
-        if not stamp.exists() or stamp.read_text(encoding="utf-8") != reqs_text:
-            argv = [str(py), "-m", "pip", "install", "--quiet",
-                    "pytest", "pytest-asyncio", "httpx", "alembic"]
-            if reqs.is_file():
-                argv += ["-r", str(reqs)]
-            subprocess.run(argv, check=True, capture_output=True, timeout=600)
-            stamp.write_text(reqs_text, encoding="utf-8")
-        return str(py), "provisioned venv"
-    except (subprocess.SubprocessError, OSError) as e:
-        return sys.executable, f"venv provisioning failed ({e!r:.120}) — using orchestrator python"
+
+    last_err = None
+    for clean_rebuild in (False, True):
+        try:
+            if clean_rebuild and venv.exists():
+                shutil.rmtree(venv, ignore_errors=True)
+            if not py.exists():
+                subprocess.run([sys.executable, "-m", "venv", str(venv)],
+                               check=True, capture_output=True, timeout=120)
+            need_install = clean_rebuild or not stamp.exists() \
+                or stamp.read_text(encoding="utf-8") != reqs_text
+            if need_install:
+                argv = [str(py), "-m", "pip", "install", "--quiet",
+                        "pytest", "pytest-asyncio", "httpx", "alembic"]
+                if reqs.is_file():
+                    argv += ["-r", str(reqs)]
+                # If a build pins an old Rust-based dep with no wheel for a very
+                # new runtime Python (2026-07-04: pydantic 2.9 / pydantic-core
+                # uses PyUnicode_DATA, removed in the Py3.14 C API — unbuildable
+                # from source at ALL), this fails fast at pip's resolver and we
+                # fall back to the orchestrator interpreter. NN-DEP-1 steers
+                # builders to wheel-available pins to avoid it.
+                subprocess.run(argv, check=True, capture_output=True, timeout=600)
+                stamp.write_text(reqs_text, encoding="utf-8")
+            return str(py), "provisioned venv" + (" (rebuilt)" if clean_rebuild else "")
+        except (subprocess.SubprocessError, OSError) as e:
+            last_err = e
+    return sys.executable, f"venv provisioning failed ({last_err!r:.120}) — using orchestrator python"
 
 
 def _check_import(py: str, backend: Path) -> dict:

@@ -174,10 +174,111 @@ def _run_cli_fallback(prompt: str, build_dir: Path, errors: list[str], log) -> N
     PROVIDERS["claude"]().run(cli_prompt, build_dir, ECHARA_ROOT / "logs", timeout_sec=600)
 
 
+# --- M5 per-module planning --------------------------------------------------
+
+def _module_floor(module: dict) -> int:
+    # Fixes breakage #6: the global 20-file floor rejected legit small module
+    # plans. Per-module floor scales with the budget instead.
+    return max(6, int(module.get("loc_budget", 800)) // 400)
+
+
+def _validate_module_plan(build_dir: Path, module: dict) -> list[str]:
+    """Parameterized validator: files under the module's path_root, count >=
+    floor. Fixes #5 (foreign/empty paths pass) and #6 (global floor too high)."""
+    name, root = module["name"], module["path_root"].rstrip("/")
+    p = build_dir / f"PLAN_{name}.md"
+    if not p.is_file():
+        return [f"PLAN_{name}.md missing"]
+    text = p.read_text(encoding="utf-8", errors="replace")
+    errors = []
+    if len(text) < 100 or "manifest" not in text.lower():
+        errors.append(f"PLAN_{name}.md too short or has no manifest section")
+    files = set(re.findall(r"(code/[\w/.\-]+\.\w+)", text))
+    under = [f for f in files if f.startswith(root + "/")]
+    if not under:
+        errors.append(f"{name}: no manifest files under path_root {root!r}")
+    elif len(under) < _module_floor(module):
+        errors.append(f"{name}: {len(under)} files under {root} < floor "
+                      f"{_module_floor(module)} — decompose further")
+    return errors
+
+
+def _module_task(prompt: str, module: dict, conventions: str, dep_seams: dict,
+                 errors: list[str] | None) -> str:
+    name, root, budget = module["name"], module["path_root"].rstrip("/"), module["loc_budget"]
+    seam_txt = json.dumps(dep_seams, indent=1) if any(dep_seams.values()) \
+        else "(this module has no dependencies to import from)"
+    err = ("\n\nPREVIOUS OUTPUT REJECTED — fix exactly:\n- " + "\n- ".join(errors)) if errors else ""
+    return f"""OVERALL SYSTEM REQUEST: {prompt}
+
+You are planning ONE module of a larger system: **{name}** (kind: {module['kind']}).
+ALL of this module's files live under: {root}/
+LOC budget: {budget}. It depends on: {module.get('depends_on', []) or 'nothing'}.
+
+Symbols you MAY import from your dependencies (do NOT redeclare them):
+{seam_txt}
+
+CONVENTIONS every module must obey:
+{conventions or '(none provided)'}
+
+Write ONE file `PLAN_{name}.md` with your file tool, then call done. Sections:
+## File manifest — one line per file: `path` — purpose. EVERY path starts with
+`{root}/`. Follow the CONVENTIONS layout (models/schemas/services/routers as
+applicable), an __init__.py for each package dir, and a tests/ subdir with real
+pytest tests for this module (success, validation, not-found, auth+ownership
+where relevant). At least {_module_floor(module)} files.
+## Implementation order — numbered, one file per step, in dependency order.{err}"""
+
+
+def _run_module_planner(prompt: str, build_dir: Path, module: dict, conventions: str,
+                        dep_seams: dict, errors: list[str] | None, log) -> None:
+    task = _module_task(prompt, module, conventions, dep_seams, errors)
+    try:
+        from providers import HARNESS_PROVIDERS
+        provider = HARNESS_PROVIDERS["cerebras_gemma"]
+        run_agent(provider, _SYSTEM, task, Context(workspace_root=build_dir.resolve()),
+                  max_rounds=6, log=log)
+        return
+    except Exception as e:  # noqa: BLE001 — harness down → claude fallback
+        log(f"planner[{module['name']}]: harness failed ({e!r}) — claude fallback")
+    from providers import PROVIDERS
+    PROVIDERS["claude"]().run(
+        _SYSTEM + "\n\n" + task + "\n\nWrite the file now; do not narrate.",
+        build_dir, ECHARA_ROOT / "logs", timeout_sec=600)
+
+
+def _run_module_planners(prompt: str, build_dir: Path, log) -> dict:
+    from agents import architect
+    modules = architect.load_modules(build_dir)
+    conventions = (build_dir / "CONVENTIONS.md").read_text(encoding="utf-8", errors="replace") \
+        if (build_dir / "CONVENTIONS.md").is_file() else ""
+    seams = json.loads((build_dir / "SEAMS.json").read_text(encoding="utf-8")) \
+        if (build_dir / "SEAMS.json").is_file() else {}
+    planned = 0
+    for m in modules:
+        if not _validate_module_plan(build_dir, m):
+            continue  # already planned + valid (cheap resume)
+        dep_seams = {d: seams.get(d, []) for d in m.get("depends_on", [])}
+        errors: list[str] | None = None
+        for _ in range(2):  # primary + one error-fed retry
+            _run_module_planner(prompt, build_dir, m, conventions, dep_seams, errors, log)
+            errors = _validate_module_plan(build_dir, m)
+            if not errors:
+                break
+            log(f"planner: module {m['name']} rejected: {errors}")
+        if errors:
+            raise PlanFailed(f"module {m['name']}: {errors}")
+        planned += 1
+    return {"model": "gemma per-module", "attempts": planned, "modules": len(modules)}
+
+
 def run_planner(prompt: str, build_dir: Path, log=lambda s: None) -> dict:
-    """Produce PLAN.md + CONTRACT_REGISTRY.json in build_dir. Raises PlanFailed
-    when even the fallback can't produce a valid plan."""
+    """Multi-module (MODULES.json present) → per-module plans; else the flat
+    single-plan path. Raises PlanFailed when a valid plan can't be produced."""
     build_dir = Path(build_dir)
+    if (build_dir / "MODULES.json").is_file():
+        return _run_module_planners(prompt, build_dir, log)
+
     attempts, model = 0, "cerebras/gemma-4-31b"
     errors: list[str] | None = None
     for _ in range(2):  # primary + one error-fed retry

@@ -17,7 +17,8 @@ import signal
 import sys
 from pathlib import Path
 
-from phases import PHASE_FNS, AgentDispatchError, VerifyFailed, real_agents
+from phases import (PHASE_FNS, AgentDispatchError, ApprovalPending, VerifyFailed,
+                    real_agents)
 from state import DONE, MAX_RETRIES, STATE_FILE, ProjectState
 
 
@@ -63,8 +64,11 @@ def _stamp_failed(state: ProjectState, build_dir: Path, error: str) -> None:
                                                   encoding="utf-8")
 
 
-def run(prompt: str | None = None, agents: dict | None = None) -> int:
+def run(prompt: str | None = None, agents: dict | None = None,
+        approve: bool = False) -> int:
     state = _bootstrap_state(prompt)
+    if approve:
+        state.approved = True  # human reviewed ARCHITECTURE.md → unblock PLAN
     state.save()
     _install_sigint_handler(state)
 
@@ -82,6 +86,15 @@ def run(prompt: str | None = None, agents: dict | None = None) -> int:
         print(f"[ECHARA] >>> {phase}")
         try:
             summary = PHASE_FNS[phase](state, build_dir, agents)
+        except ApprovalPending as e:
+            # Architecture drafted + validated, awaiting human sign-off (gate 1).
+            # State stays at PLAN; --approve on the next run continues.
+            state.save()
+            print(f"[ECHARA] APPROVAL NEEDED — {e}\n"
+                  f"[ECHARA] review {build_dir.as_posix()}/ARCHITECTURE.md, "
+                  f"MODULES.json, CONVENTIONS.md, SEAMS.json — then run:\n"
+                  f"[ECHARA]   python orchestrator.py --approve")
+            return 0
         except AgentDispatchError as e:
             # Every lane for this agent is down (rate limits, dead CLIs).
             # Retrying immediately would hit the same dead lanes — stamp a
@@ -118,5 +131,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", default=None,
                         help="User request for a new build (omit to resume).")
+    parser.add_argument("--approve", action="store_true",
+                        help="Approve the drafted architecture and continue (M5 gate 1).")
     args = parser.parse_args()
-    sys.exit(run(args.prompt))
+    sys.exit(run(args.prompt, approve=args.approve))

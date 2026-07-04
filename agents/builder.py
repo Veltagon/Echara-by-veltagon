@@ -14,6 +14,7 @@ waves; burning 90s per wave re-proving it is waste).
 """
 from __future__ import annotations
 
+import json
 import py_compile
 import re
 import time
@@ -193,20 +194,58 @@ def _fix_prompt(last_error: str, ctx: str) -> str:
         f"{ctx}")
 
 
+def _module_context(build_dir: Path, module: dict, seams: dict, conventions: str,
+                    module_plan: str, skill_rel: str | None) -> str:
+    """Flat, per-MODULE context (M5): CONVENTIONS + only the seams of THIS
+    module's dependencies + accurate on-disk interfaces of self+deps + this
+    module's own plan + journal tail. The global plan is never embedded — this
+    is what keeps context constant from module 1 to module 16."""
+    deps = module.get("depends_on", [])
+    parts = [_NN_RULES]
+    if conventions.strip():
+        parts.append("=== CONVENTIONS (obey exactly) ===\n" + conventions)
+    dep_seams = {d: seams.get(d, []) for d in deps}
+    if any(dep_seams.values()):
+        parts.append("=== SEAMS YOU MAY IMPORT (from dependency modules — do NOT "
+                     "redeclare these) ===\n" + json.dumps(dep_seams, indent=1))
+    iface = interfaces.read_interfaces(build_dir, [module.get("name", ""), *deps])
+    if iface.strip():
+        parts.append("=== INTERFACES ALREADY ON DISK (accurate signatures — import "
+                     "from these) ===\n" + iface)
+    if module_plan.strip():
+        parts.append(f"=== THIS MODULE ({module.get('name')}) PLAN ===\n" + module_plan)
+    journal = progress.journal_tail(build_dir)
+    if journal.strip():
+        parts.append("=== BUILD JOURNAL (recent decisions) ===\n" + journal)
+    if skill_rel:
+        parts.append(f"=== SKILL ===\nBackend skill at `{skill_rel}/SKILL.md` — "
+                     "principles only; ignore Node.js specifics.")
+    return "\n\n".join(parts)
+
+
 def _slug(label: str) -> str:
     return re.sub(r"[^\w]+", "_", label).strip("_")
 
 
+def _read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+
+
+def _read_json(p: Path, default):
+    if not p.is_file():
+        return default
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return default
+
+
 def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> dict:
-    """Dispatch the build (waves for big manifests, single-pass for small,
-    one focused fix-pass on retry). Interfaces are regenerated from disk after
-    every wave so the next wave gets accurate signatures, not guesses. Raises
-    BuildDispatchFailed only when every lane is dead — bad code is the
-    Verifier's problem."""
+    """Dispatch the build. Single-module (PLAN.md) or multi-module (MODULES.json
+    + PLAN_<module>.md, built in topological order) — each module's waves get a
+    flat, per-module context. Interfaces regenerate from disk after every wave.
+    Raises BuildDispatchFailed only when every lane is dead."""
     build_dir = Path(build_dir)
-    plan_md = (build_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
-    contract = (build_dir / "CONTRACT_REGISTRY.json").read_text(encoding="utf-8", errors="replace")
-    module, module_dir = _DEFAULT_MODULE, build_dir / "code"
 
     skill_rel = None
     pool = skills_router.DEFAULT_POOL_ROOT
@@ -243,56 +282,89 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             log(f"builder: {failures[-1]} — lane dead for this build")
         raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
 
-    def ctx() -> str:
-        return _wave_context(build_dir, module, [], plan_md, contract, skill_rel,
-                             progress.journal_tail(build_dir))
-
-    def gate(label: str, chunk: list[str], prog: dict) -> None:
-        """py_compile tripwire + ONE budgeted fix. A gate is a tripwire, not a
-        convergence loop — one fix, then continue (VERIFY is the real floor)."""
-        interfaces.write_module_interface(build_dir, module, module_dir)
-        errors = _wave_gate(build_dir, chunk)
-        if errors:
-            log(f"builder: {label} gate — {len(errors)} issue(s)")
-            if progress.can_fix(prog):
-                progress.record_fix(build_dir, prog, module, "gate")  # persist BEFORE dispatch
-                dispatch(f"{label} gate-fix", _gate_fix_prompt(errors, ctx()))
-                interfaces.write_module_interface(build_dir, module, module_dir)
-            else:
-                log("builder: global fix budget exhausted — VERIFY will catch it")
-        progress.journal_append(
-            build_dir, f"{label}: {', '.join(Path(f).name for f in chunk)}"
-            + (f" [gate:{len(errors)} flagged]" if errors else " [gate ok]"))
-
-    n_passes = 0
-    if last_error:
-        dispatch("fix", _fix_prompt(last_error, ctx()))
-        n_passes = 1
-    else:
+    def build_module(mname: str, module_dir: Path, plan_md: str, ctx_fn, prog: dict) -> int:
+        """Wave over one module's files with per-wave gate + interface regen."""
         files = _implementation_order(plan_md)
-        if not files:
-            # Empty file list would silently dispatch a no-op wave (#5).
-            raise BuildDispatchFailed(
-                "plan produced an empty file list — no recognized manifest paths")
-        prog = progress.load(build_dir)
-        if len(files) > SINGLE_PASS_MAX:
-            chunks = _waves(files)
-            for i, chunk in enumerate(chunks):
-                if all((build_dir / f).is_file() for f in chunk):
-                    log(f"builder: wave {i + 1}/{len(chunks)} already on disk — skipped")
-                    continue
-                label = f"wave {i + 1}/{len(chunks)}"
-                dispatch(label, _wave_prompt(i + 1, len(chunks), chunk, ctx()))
-                gate(label, chunk, prog)
-                progress.module_state(prog, module)["waves_done"] += 1
-                progress.save(build_dir, prog)
-                n_passes += 1
-            dispatch("integration", _integration_prompt(ctx()))
-            n_passes += 1
+        if not files:  # empty/foreign-path plan would dispatch a no-op wave (#5)
+            raise BuildDispatchFailed(f"module {mname!r}: plan produced no file list")
+        chunks = _waves(files) if len(files) > SINGLE_PASS_MAX else [files]
+        passes = 0
+        for i, chunk in enumerate(chunks):
+            if all((build_dir / f).is_file() for f in chunk):
+                log(f"builder: {mname} wave {i + 1}/{len(chunks)} on disk — skipped")
+                continue
+            label = f"{mname} w{i + 1}/{len(chunks)}"
+            dispatch(label, _wave_prompt(i + 1, len(chunks), chunk, ctx_fn()))
+            interfaces.write_module_interface(build_dir, mname, module_dir)
+            errors = _wave_gate(build_dir, chunk)
+            if errors:
+                log(f"builder: {label} gate — {len(errors)} issue(s)")
+                if progress.can_fix(prog):
+                    progress.record_fix(build_dir, prog, mname, "gate")  # persist BEFORE dispatch
+                    dispatch(f"{label} gate-fix", _gate_fix_prompt(errors, ctx_fn()))
+                    interfaces.write_module_interface(build_dir, mname, module_dir)
+                else:
+                    log("builder: global fix budget exhausted — VERIFY will catch it")
+            progress.journal_append(
+                build_dir, f"{label}: {', '.join(Path(f).name for f in chunk)}"
+                + (f" [gate:{len(errors)}]" if errors else ""))
+            progress.module_state(prog, mname)["waves_done"] += 1
+            progress.save(build_dir, prog)
+            passes += 1
+        return passes
+
+    prog = progress.load(build_dir)
+    is_multi = (build_dir / "MODULES.json").is_file()
+
+    if last_error:
+        # Fix pass — one context. Phase D routes per-module; for now, one shot.
+        if is_multi:
+            from agents import architect
+            seams = _read_json(build_dir / "SEAMS.json", {})
+            conv = _read_text(build_dir / "CONVENTIONS.md")
+            allmods = {"name": "__all__", "depends_on": list(m["name"] for m in architect.load_modules(build_dir))}
+            fix_ctx = _module_context(build_dir, allmods, seams, conv, "", skill_rel)
         else:
-            dispatch("single", _wave_prompt(1, 1, files, ctx()))
-            gate("single", files, prog)
-            n_passes = 1
+            plan_md = _read_text(build_dir / "PLAN.md")
+            contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"
+            fix_ctx = _wave_context(build_dir, _DEFAULT_MODULE, [], plan_md, contract,
+                                    skill_rel, progress.journal_tail(build_dir))
+        dispatch("fix", _fix_prompt(last_error, fix_ctx))
+        n_passes = 1
+    elif is_multi:
+        from agents import architect
+        seams = _read_json(build_dir / "SEAMS.json", {})
+        conventions = _read_text(build_dir / "CONVENTIONS.md")
+        modules = {m["name"]: m for m in architect.load_modules(build_dir)}
+        n_passes = 0
+        for mname in architect.module_order(build_dir):  # deps first
+            m = modules[mname]
+            plan_path = build_dir / f"PLAN_{mname}.md"
+            if not plan_path.is_file():
+                raise BuildDispatchFailed(f"module {mname}: PLAN_{mname}.md missing")
+            plan_md = plan_path.read_text(encoding="utf-8", errors="replace")
+
+            def ctx_fn(m=m, plan_md=plan_md):
+                return _module_context(build_dir, m, seams, conventions, plan_md, skill_rel)
+
+            n_passes += build_module(mname, build_dir / m["path_root"], plan_md, ctx_fn, prog)
+        # Phase C: one final integration pass (Phase D replaces with per-module).
+        integ_ctx = _module_context(
+            build_dir, {"name": "__all__", "depends_on": list(modules)},
+            seams, conventions, "", skill_rel)
+        dispatch("integration", _integration_prompt(integ_ctx))
+        n_passes += 1
+    else:
+        plan_md = _read_text(build_dir / "PLAN.md")
+        contract = _read_text(build_dir / "CONTRACT_REGISTRY.json") or "{}"
+
+        def ctx_fn():
+            return _wave_context(build_dir, _DEFAULT_MODULE, [], plan_md, contract,
+                                 skill_rel, progress.journal_tail(build_dir))
+
+        n_passes = build_module(_DEFAULT_MODULE, build_dir / "code", plan_md, ctx_fn, prog)
+        dispatch("integration", _integration_prompt(ctx_fn()))
+        n_passes += 1
 
     return {"provider": "+".join(sorted(set(used))) or "none", "waves": n_passes,
             "elapsed_sec": round(time.monotonic() - started, 2)}

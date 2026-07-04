@@ -127,5 +127,5 @@ def test_empty_file_list_guard(tmp_path, monkeypatch):
     (build / "PLAN.md").write_text("## File manifest\nsrc/main.py — entry\n", encoding="utf-8")
     (build / "CONTRACT_REGISTRY.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(builder.skills_router, "DEFAULT_POOL_ROOT", tmp_path / "nopool")
-    with pytest.raises(builder.BuildDispatchFailed, match="empty file list"):
+    with pytest.raises(builder.BuildDispatchFailed, match="no file list"):
         builder.run_builder(build)

@@ -34,6 +34,8 @@ class ProjectState:
     user_prompt: str = ""
     retry_count: int = 0
     last_error: str = ""  # exact verify failure fed back to Builder on retry
+    approved: bool = False  # human approved ARCHITECTURE.md (M5 gate 1); default
+    # keeps old PROJECT_STATE.json load-compatible.
 
     @classmethod
     def new(cls) -> "ProjectState":

@@ -27,11 +27,18 @@ class AgentDispatchError(Exception):
     stamps a failed verdict and leaves state resumable."""
 
 
+class ApprovalPending(Exception):
+    """Architecture is drafted and validated but not yet human-approved (M5
+    gate 1). The orchestrator catches this, saves state, tells the user which
+    files to review + to re-run with --approve, and exits 0 (not a failure)."""
+
+
 def real_agents() -> dict:
     """Late imports so the dry-run path never loads provider/LLM machinery."""
-    from agents import builder, planner, repairs, verifier
+    from agents import architect, builder, planner, repairs, verifier
 
     return {
+        "architect": architect.run_architect,
         "planner": planner.run_planner,
         "builder": builder.run_builder,
         "repair": repairs.repair_all,
@@ -48,6 +55,19 @@ def phase_intake(state: ProjectState, build_dir: Path, agents: dict) -> str:
 
 
 def phase_plan(state: ProjectState, build_dir: Path, agents: dict) -> str:
+    # M5 hierarchical planning: an Architect decomposes the request into modules,
+    # a HUMAN approves the architecture (gate 1), then per-module planners run.
+    # When no architect agent is wired (dry-run stubs), fall straight through to
+    # the flat single-plan path — the pipeline tests are unaffected.
+    architect = agents.get("architect")
+    if architect is not None:
+        if not (build_dir / "ARCHITECTURE.md").is_file():
+            arch = architect(state.user_prompt, build_dir)
+            log_line = f"architect drafted {arch.get('modules', '?')} modules"
+        else:
+            log_line = "architecture already drafted"
+        if (build_dir / "MODULES.json").is_file() and not state.approved:
+            raise ApprovalPending(log_line + " — review and approve to continue")
     info = agents["planner"](state.user_prompt, build_dir)
     return f"plan written by {info.get('model', '?')} in {info.get('attempts', '?')} attempt(s)"
 

@@ -18,6 +18,7 @@ import re
 import time
 from pathlib import Path
 
+from agents import interfaces
 from skills import router as skills_router
 from harness import skills as skills_stage
 from phases import AgentDispatchError
@@ -25,6 +26,9 @@ from phases import AgentDispatchError
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
 WAVE_SIZE = 8
 SINGLE_PASS_MAX = 12
+# Single-module builds (current pipeline) use this synthetic module name for the
+# deterministic interface index; Phase C replaces it with real MODULES.json names.
+_DEFAULT_MODULE = "app"
 
 
 class BuildDispatchFailed(AgentDispatchError):
@@ -102,23 +106,37 @@ def _waves(files: list[str], size: int = WAVE_SIZE) -> list[list[str]]:
     return [files[i:i + size] for i in range(0, len(files), size)]
 
 
-def _base_context(plan_md: str, contract: str, skill_rel: str | None) -> str:
-    skill_block = ""
+def _wave_context(build_dir: Path, module: str, deps: list[str], plan_md: str,
+                  contract: str, skill_rel: str | None, journal_tail: str = "") -> str:
+    """Flat wave context. The deterministic interface index (accurate signatures
+    of everything built so far, read fresh from disk) REPLACES the old 'READ
+    earlier waves and guess' instruction — the drift fix (#2). Regenerated each
+    wave; costs zero tokens to produce."""
+    parts = [_NN_RULES]
+    iface = interfaces.read_interfaces(build_dir, [module, *deps])
+    if iface.strip():
+        parts.append(
+            "=== INTERFACES ALREADY ON DISK (accurate signatures — import from "
+            "these, do NOT re-read or redeclare them) ===\n" + iface)
+    parts.append("=== PLAN.md ===\n" + plan_md)
+    parts.append("=== CONTRACT_REGISTRY.json ===\n" + contract)
+    if journal_tail.strip():
+        parts.append("=== BUILD JOURNAL (recent decisions) ===\n" + journal_tail)
     if skill_rel:
-        skill_block = (f"\n=== SKILL ===\nA backend-development skill is at "
-                       f"`{skill_rel}/SKILL.md`. Read it for principles. Ignore "
-                       "Node.js specifics — this project is Python/FastAPI.\n")
-    return (f"{_NN_RULES}\n\n=== PLAN.md ===\n{plan_md}\n"
-            f"\n=== CONTRACT_REGISTRY.json ===\n{contract}\n{skill_block}")
+        parts.append(f"=== SKILL ===\nA backend-development skill is at "
+                     f"`{skill_rel}/SKILL.md`. Read it for principles. Ignore "
+                     "Node.js specifics — the backend is Python/FastAPI.")
+    return "\n\n".join(parts)
 
 
 def _wave_prompt(n: int, total: int, files: list[str], ctx: str) -> str:
     listing = "\n".join(f"- {f}" for f in files)
     return (
-        f"TASK: Wave {n} of {total} of a phased build. Files from earlier waves "
-        "already exist on disk — READ them for interfaces and imports; do NOT "
-        "rewrite them. Implement ONLY the following manifest files now, "
-        "completely, with production-quality code (no stubs, no TODOs):\n"
+        f"TASK: Wave {n} of {total} of a phased build. Everything built so far is "
+        "listed with accurate signatures in the INTERFACES section below — import "
+        "from those, do NOT re-read or rewrite existing files. Implement ONLY the "
+        "following manifest files now, completely, with production-quality code "
+        "(no stubs, no TODOs):\n"
         f"{listing}\n\n"
         "Every listed file must exist with full real code when you stop. Do not "
         "touch files outside this list. Do not narrate; do not ask questions.\n\n"
@@ -145,16 +163,20 @@ def _fix_prompt(last_error: str, ctx: str) -> str:
         f"{ctx}")
 
 
+def _slug(label: str) -> str:
+    return re.sub(r"[^\w]+", "_", label).strip("_")
+
+
 def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> dict:
     """Dispatch the build (waves for big manifests, single-pass for small,
-    one focused fix-pass on retry). Raises BuildDispatchFailed only when every
-    lane is dead — bad code is the Verifier's problem."""
-    from providers import PROVIDERS
-    from providers import availability
-
+    one focused fix-pass on retry). Interfaces are regenerated from disk after
+    every wave so the next wave gets accurate signatures, not guesses. Raises
+    BuildDispatchFailed only when every lane is dead — bad code is the
+    Verifier's problem."""
     build_dir = Path(build_dir)
     plan_md = (build_dir / "PLAN.md").read_text(encoding="utf-8", errors="replace")
     contract = (build_dir / "CONTRACT_REGISTRY.json").read_text(encoding="utf-8", errors="replace")
+    module, module_dir = _DEFAULT_MODULE, build_dir / "code"
 
     skill_rel = None
     pool = skills_router.DEFAULT_POOL_ROOT
@@ -163,30 +185,15 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         if (staged / "senior-backend" / "SKILL.md").is_file():
             skill_rel = "skills/senior-backend"
 
-    ctx = _base_context(plan_md, contract, skill_rel)
-    if last_error:
-        prompts = [("fix", _fix_prompt(last_error, ctx))]
-    else:
-        files = _implementation_order(plan_md)
-        if len(files) > SINGLE_PASS_MAX:
-            chunks = _waves(files)
-            prompts = []
-            for i, chunk in enumerate(chunks):
-                # Resume cheaply: a wave whose files all exist already ran.
-                if all((build_dir / f).is_file() for f in chunk):
-                    log(f"builder: wave {i + 1}/{len(chunks)} already on disk — skipped")
-                    continue
-                prompts.append((f"wave {i + 1}/{len(chunks)}",
-                                _wave_prompt(i + 1, len(chunks), chunk, ctx)))
-            prompts.append(("integration", _integration_prompt(ctx)))
-        else:
-            prompts = [("single", _wave_prompt(1, 1, files, ctx))]
-    (build_dir / "BUILDER_PROMPT.md").write_text(prompts[-1][1], encoding="utf-8")
+    dead: set[str] = set()  # lanes that hard-failed this build — don't retry per wave
+    used: list[str] = []
+    started = time.monotonic()
 
-    dead: set[str] = set()  # lanes that hard-failed this build — don't retry them per wave
-    used, started = [], time.monotonic()
-    for label, prompt in prompts:
-        dispatched = False
+    def dispatch(label: str, prompt: str) -> None:
+        """Run one wave/pass on the first live lane; record forensics per pass
+        (fixes #11 — no more single overwritten BUILDER_PROMPT.md)."""
+        from providers import PROVIDERS, availability
+        (build_dir / f"BUILDER_PROMPT_{_slug(label)}.md").write_text(prompt, encoding="utf-8")
         failures = []
         for name in ("claude", "codex"):
             if name in dead:
@@ -199,13 +206,42 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                                            timeout_sec=1500)
             if result.ok:
                 used.append(name)
-                dispatched = True
-                break
+                return
             dead.add(name)
             failures.append(f"{name}: exit={result.exit_code} kill={result.kill_reason} "
                             f"skip={result.skipped_reason}")
             log(f"builder: {failures[-1]} — lane dead for this build")
-        if not dispatched:
-            raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
-    return {"provider": "+".join(sorted(set(used))), "waves": len(prompts),
+        raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
+
+    def ctx(journal_tail: str = "") -> str:
+        return _wave_context(build_dir, module, [], plan_md, contract, skill_rel, journal_tail)
+
+    n_passes = 0
+    if last_error:
+        dispatch("fix", _fix_prompt(last_error, ctx()))
+        n_passes = 1
+    else:
+        files = _implementation_order(plan_md)
+        if not files:
+            # Empty file list would silently dispatch a no-op wave (#5).
+            raise BuildDispatchFailed(
+                "plan produced an empty file list — no recognized manifest paths")
+        if len(files) > SINGLE_PASS_MAX:
+            chunks = _waves(files)
+            for i, chunk in enumerate(chunks):
+                if all((build_dir / f).is_file() for f in chunk):
+                    log(f"builder: wave {i + 1}/{len(chunks)} already on disk — skipped")
+                    continue
+                dispatch(f"wave {i + 1}/{len(chunks)}",
+                         _wave_prompt(i + 1, len(chunks), chunk, ctx()))
+                interfaces.write_module_interface(build_dir, module, module_dir)
+                n_passes += 1
+            dispatch("integration", _integration_prompt(ctx()))
+            n_passes += 1
+        else:
+            dispatch("single", _wave_prompt(1, 1, files, ctx()))
+            interfaces.write_module_interface(build_dir, module, module_dir)
+            n_passes = 1
+
+    return {"provider": "+".join(sorted(set(used))) or "none", "waves": n_passes,
             "elapsed_sec": round(time.monotonic() - started, 2)}

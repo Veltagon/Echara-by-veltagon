@@ -7,6 +7,7 @@ completed phase.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +16,10 @@ PHASES = ["INTAKE", "PLAN", "BUILD", "REPAIR", "VERIFY", "DELIVER"]
 DONE = "DONE"
 STATE_FILE = Path("PROJECT_STATE.json")
 MAX_RETRIES = 3
+# Where builds live. Default "builds/" (relative) keeps tests isolated under
+# their tmp cwd. Scale runs set ECHARA_BUILDS_ROOT=Z:/echara_builds to move the
+# 30k-LOC × 80-session fsync churn off OneDrive (M5 plan risk #15).
+BUILDS_ROOT = os.environ.get("ECHARA_BUILDS_ROOT", "builds")
 
 
 @dataclass
@@ -39,7 +44,7 @@ class ProjectState:
         now = datetime.now().isoformat(timespec="seconds")
         return cls(
             build_id=build_id,
-            build_dir=f"builds/{build_id}",
+            build_dir=str(Path(BUILDS_ROOT) / build_id),
             current_phase=PHASES[0],
             started_at=now,
             last_updated=now,

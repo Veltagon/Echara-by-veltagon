@@ -526,15 +526,29 @@ REPAIRS = [
 ]
 
 
+def _fsync_file(path: Path, retries: int = 3) -> None:
+    """fsync one file, retrying transient locks (antivirus / a sync client
+    briefly holding a handle — M5 plan #15). Gives up quietly after `retries`."""
+    for attempt in range(retries):
+        try:
+            with open(path, "rb+") as fh:
+                os.fsync(fh.fileno())
+            return
+        except PermissionError:
+            time.sleep(0.1 * (attempt + 1))
+        except OSError:
+            return  # not a lock (e.g. deleted) — nothing to retry
+
+
 def _post_repair_barrier(code_dir: Path, started_ts: float) -> None:
     """fsync every file touched since the pass started, then flip the marker."""
     for f in code_dir.rglob("*"):
         try:
-            if f.is_file() and f.stat().st_mtime >= started_ts - 1:
-                with open(f, "rb+") as fh:
-                    os.fsync(fh.fileno())
+            touched = f.is_file() and f.stat().st_mtime >= started_ts - 1
         except OSError:
             continue
+        if touched:
+            _fsync_file(f)
     pending = code_dir / ".repairs_pending"
     if pending.exists():
         os.replace(pending, code_dir / ".repairs_complete")
@@ -553,11 +567,7 @@ def _wait_for_repair_barrier(code_dir: Path, timeout_s: float = 30.0) -> None:
         if not d.is_dir():
             continue
         for f in d.rglob("*.py"):
-            try:
-                with open(f, "rb+") as fh:
-                    os.fsync(fh.fileno())
-            except OSError:
-                continue
+            _fsync_file(f)
 
 
 def repair_all(code_dir: Path) -> list[str]:

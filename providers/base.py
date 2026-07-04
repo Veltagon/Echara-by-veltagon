@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -163,7 +164,9 @@ class Provider(ABC):
     ) -> RunResult:
         cwd.mkdir(parents=True, exist_ok=True)
         log_dir.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
+        # Microsecond resolution: at 80 sessions/build, second-resolution names
+        # collide and overwrite each other's forensics (#11).
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         stdout_path = log_dir / f"{self.name}_{ts}.stdout.log"
         stderr_path = log_dir / f"{self.name}_{ts}.stderr.log"
         prompt_path = log_dir / f"{self.name}_{ts}.prompt.txt"
@@ -198,14 +201,9 @@ class Provider(ABC):
                     stdin=subprocess.PIPE if self.stdin_prompt else subprocess.DEVNULL,
                     env=merged_env,
                 )
-                if self.stdin_prompt:
-                    # Prompt is a few KB; OS pipe buffers dwarf it, so a
-                    # synchronous write-and-close can't deadlock here.
-                    try:
-                        proc.stdin.write(prompt.encode("utf-8"))
-                        proc.stdin.close()
-                    except OSError:
-                        pass  # child died early — exit code will tell the story
+                # Start the idle watcher FIRST (#12): a wave prompt is now
+                # 25-50KB; if it ever exceeds the OS pipe buffer and the child
+                # wedges before reading, the watcher is the only kill path.
                 watcher_thread = threading.Thread(
                     target=_idle_watcher,
                     args=(
@@ -217,6 +215,17 @@ class Provider(ABC):
                     daemon=True,
                 )
                 watcher_thread.start()
+                if self.stdin_prompt:
+                    # Write in a daemon thread so a full pipe buffer can never
+                    # block the main thread from reaching proc.wait() (and thus
+                    # the watcher's kill path).
+                    def _feed_stdin(pipe=proc.stdin, data=prompt.encode("utf-8")):
+                        try:
+                            pipe.write(data)
+                            pipe.close()
+                        except OSError:
+                            pass  # child died early — exit code tells the story
+                    threading.Thread(target=_feed_stdin, daemon=True).start()
 
                 try:
                     exit_code = proc.wait(timeout=timeout_sec)

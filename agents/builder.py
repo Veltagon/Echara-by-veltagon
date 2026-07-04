@@ -14,11 +14,13 @@ waves; burning 90s per wave re-proving it is waste).
 """
 from __future__ import annotations
 
+import py_compile
 import re
 import time
 from pathlib import Path
 
 from agents import interfaces
+from agents import progress
 from skills import router as skills_router
 from harness import skills as skills_stage
 from phases import AgentDispatchError
@@ -153,6 +155,34 @@ def _integration_prompt(ctx: str) -> str:
         f"{ctx}")
 
 
+def _wave_gate(build_dir: Path, wave_files: list[str]) -> list[str]:
+    """Syntax tripwire after a wave: every listed file must exist, and each .py
+    must compile. Catches the wave-3 syntax bug that would otherwise poison
+    waves 4-25 before end-loaded VERIFY sees it (#4). NOT a full import — a
+    sibling may legitimately not exist yet; that's the integration gate's job."""
+    errors: list[str] = []
+    for f in wave_files:
+        p = build_dir / f
+        if not p.is_file():
+            errors.append(f"{f}: MISSING (wave did not create it)")
+        elif p.suffix == ".py":
+            try:
+                py_compile.compile(str(p), doraise=True)
+            except py_compile.PyCompileError as e:
+                errors.append(f"{f}: {str(e).splitlines()[-1][:200]}")
+    return errors
+
+
+def _gate_fix_prompt(errors: list[str], ctx: str) -> str:
+    listing = "\n".join(f"- {e}" for e in errors)
+    return (
+        "TASK: The wave you just wrote has syntax errors or missing files. Fix "
+        "ONLY these, completely, then stop. Do not touch other files; do not "
+        "add features; do not narrate:\n"
+        f"{listing}\n\n"
+        f"{ctx}")
+
+
 def _fix_prompt(last_error: str, ctx: str) -> str:
     return (
         "TASK: The build exists but verification failed. Fix exactly these "
@@ -213,8 +243,26 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             log(f"builder: {failures[-1]} — lane dead for this build")
         raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
 
-    def ctx(journal_tail: str = "") -> str:
-        return _wave_context(build_dir, module, [], plan_md, contract, skill_rel, journal_tail)
+    def ctx() -> str:
+        return _wave_context(build_dir, module, [], plan_md, contract, skill_rel,
+                             progress.journal_tail(build_dir))
+
+    def gate(label: str, chunk: list[str], prog: dict) -> None:
+        """py_compile tripwire + ONE budgeted fix. A gate is a tripwire, not a
+        convergence loop — one fix, then continue (VERIFY is the real floor)."""
+        interfaces.write_module_interface(build_dir, module, module_dir)
+        errors = _wave_gate(build_dir, chunk)
+        if errors:
+            log(f"builder: {label} gate — {len(errors)} issue(s)")
+            if progress.can_fix(prog):
+                progress.record_fix(build_dir, prog, module, "gate")  # persist BEFORE dispatch
+                dispatch(f"{label} gate-fix", _gate_fix_prompt(errors, ctx()))
+                interfaces.write_module_interface(build_dir, module, module_dir)
+            else:
+                log("builder: global fix budget exhausted — VERIFY will catch it")
+        progress.journal_append(
+            build_dir, f"{label}: {', '.join(Path(f).name for f in chunk)}"
+            + (f" [gate:{len(errors)} flagged]" if errors else " [gate ok]"))
 
     n_passes = 0
     if last_error:
@@ -226,21 +274,24 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             # Empty file list would silently dispatch a no-op wave (#5).
             raise BuildDispatchFailed(
                 "plan produced an empty file list — no recognized manifest paths")
+        prog = progress.load(build_dir)
         if len(files) > SINGLE_PASS_MAX:
             chunks = _waves(files)
             for i, chunk in enumerate(chunks):
                 if all((build_dir / f).is_file() for f in chunk):
                     log(f"builder: wave {i + 1}/{len(chunks)} already on disk — skipped")
                     continue
-                dispatch(f"wave {i + 1}/{len(chunks)}",
-                         _wave_prompt(i + 1, len(chunks), chunk, ctx()))
-                interfaces.write_module_interface(build_dir, module, module_dir)
+                label = f"wave {i + 1}/{len(chunks)}"
+                dispatch(label, _wave_prompt(i + 1, len(chunks), chunk, ctx()))
+                gate(label, chunk, prog)
+                progress.module_state(prog, module)["waves_done"] += 1
+                progress.save(build_dir, prog)
                 n_passes += 1
             dispatch("integration", _integration_prompt(ctx()))
             n_passes += 1
         else:
             dispatch("single", _wave_prompt(1, 1, files, ctx()))
-            interfaces.write_module_interface(build_dir, module, module_dir)
+            gate("single", files, prog)
             n_passes = 1
 
     return {"provider": "+".join(sorted(set(used))) or "none", "waves": n_passes,

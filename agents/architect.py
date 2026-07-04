@@ -79,12 +79,18 @@ the current directory with your file tool, then stop. Do not write any code.
 
 FRONTEND: if the request asks for a UI, ALSO include frontend module(s) in
 MODULES.json (kind "frontend", path_root under "code/frontend"), and write a
-FIFTH file CONTRACT_REGISTRY.json describing the API the frontend consumes:
-{{"api_endpoints": [{{"method","path","request_schema","response_schema",
-"auth_required"}}], "shared_types": [{{"name","fields","required"}}],
-"db_tables": [], "env_vars": [], "dependencies": []}}. The frontend client is
-generated from this file — it must be complete. If the request is backend-only,
-do NOT create a frontend module.{err}"""
+FIFTH file CONTRACT_REGISTRY.json — a JSON OBJECT (not a bare array) of this
+EXACT shape:
+{{"api_endpoints": [{{"method","path","request_schema","response_schema","auth_required"}}],
+  "shared_types": [{{"name": "BookmarkPublic",
+     "fields": {{"id": "int", "url": "str", "tags": "list[str]"}},
+     "required": ["id", "url"]}}],
+  "db_tables": [], "env_vars": [], "dependencies": []}}
+shared_types MUST list every request/response schema the endpoints name, with
+its fields — the frontend TypeScript client is generated from this, so bare
+schema NAMES without fields produce useless types. Use plain unqualified schema
+names (e.g. "BookmarkPublic", not "bookmarks.BookmarkPublic"). If the request is
+backend-only, do NOT create a frontend module.{err}"""
 
 
 def validate_architecture(build_dir: Path) -> list[str]:

@@ -68,3 +68,28 @@ def test_frontend_check_skips_when_absent(tmp_path):
     # No code/frontend -> the frontend leg is skipped entirely (None), so a
     # pure-backend build's verdict is unaffected.
     assert verifier._check_frontend(tmp_path) is None
+
+
+def test_codegen_robust_to_bare_list_and_namespaced(tmp_path):
+    # The architect emits a BARE endpoint list with module-namespaced schema
+    # names and no shared_types (E1, 2026-07-05) — this used to crash BUILD.
+    contract = [
+        {"method": "POST", "path": "/auth/register",
+         "request_schema": "auth.RegisterRequest", "response_schema": "auth.UserPublic"},
+        {"method": "GET", "path": "/bookmarks",
+         "request_schema": None, "response_schema": "bookmarks.BookmarkPage"},
+    ]
+    written = cg.generate(contract, tmp_path / "code" / "frontend")  # must not raise
+    types = written[0].read_text(encoding="utf-8")
+    client = written[1].read_text(encoding="utf-8")
+    # namespaces stripped, placeholders emitted so it type-checks
+    assert "export interface UserPublic { [key: string]: unknown; }" in types
+    assert "auth." not in client and "bookmarks." not in types
+    assert "postAuthRegister(body: RegisterRequest): Promise<UserPublic>" in client
+
+
+def test_codegen_never_raises_on_garbage(tmp_path):
+    assert cg.generate("not a contract", tmp_path / "f1") == \
+        [tmp_path / "f1" / "src" / "api" / "types.ts",
+         tmp_path / "f1" / "src" / "api" / "client.ts"]
+    assert cg.generate({}, tmp_path / "f2")  # empty dict -> empty but valid files

@@ -438,9 +438,12 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         # module builds (the seam a model must never hand-write).
         if any(m.get("kind") == "frontend" for m in modules.values()):
             from agents import contract_codegen
-            written = contract_codegen.generate_from_build(build_dir)
-            if written:
-                log(f"builder: generated frontend API client ({len(written)} files)")
+            try:
+                written = contract_codegen.generate_from_build(build_dir)
+                if written:
+                    log(f"builder: generated frontend API client ({len(written)} files)")
+            except Exception as e:  # noqa: BLE001 — never let codegen kill BUILD
+                log(f"builder: contract codegen skipped ({e!r})")
         n_passes = 0
         for mname in architect.module_order(build_dir):  # deps first
             m = modules[mname]

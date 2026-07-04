@@ -21,18 +21,23 @@ _SCALARS = {
 }
 
 
+def _strip_ns(name: str) -> str:
+    """'auth.UserPublic' -> 'UserPublic' — the architect namespaces schemas by
+    module; frontend interfaces are flat, so drop the prefix consistently."""
+    return name.rsplit(".", 1)[-1]
+
+
 def ts_type(pytype) -> str:
-    """Map a contract type string to TypeScript. Handles list[X]/List[X] and
-    strips constraint noise like 'str (1..200)'."""
+    """Map a contract type string to TypeScript. Handles list[X]/List[X],
+    module-namespaced names, and strips constraint noise like 'str (1..200)'."""
     s = str(pytype).strip()
     m = re.match(r"(?:list|List)\[(.+)\]$", s)
     if m:
         return ts_type(m.group(1)) + "[]"
-    base = re.split(r"[\s(\[]", s, 1)[0].lower()
-    if base in _SCALARS:
-        return _SCALARS[base]
-    # Unknown, non-scalar token → treat as a referenced interface name (keep case)
-    ref = re.split(r"[\s(\[]", s, 1)[0]
+    token = re.split(r"[\s(\[]", s, 1)[0]
+    if token.lower() in _SCALARS:
+        return _SCALARS[token.lower()]
+    ref = _strip_ns(token)
     return ref if re.match(r"^[A-Za-z_]\w*$", ref) else "unknown"
 
 
@@ -63,8 +68,8 @@ def _referenced_types(endpoints: list[dict]) -> list[str]:
             if not v:
                 continue
             base = re.sub(r"(?:list|List)\[(.+)\]$", r"\1", str(v))
-            base = re.split(r"[\s(\[]", base, 1)[0]
-            if re.match(r"^[A-Z]\w*$", base):  # an interface name, not a scalar
+            base = _strip_ns(re.split(r"[\s(\[]", base, 1)[0])
+            if base and base.lower() not in _SCALARS and re.match(r"^[A-Z]\w*$", base):
                 names.add(base)
     return sorted(names)
 
@@ -117,14 +122,38 @@ def gen_client(endpoints: list[dict]) -> str:
     return "\n\n".join(parts) + "\n"
 
 
-def generate(contract: dict, frontend_root: Path) -> list[Path]:
-    """Write src/api/{types,client}.ts under frontend_root. Returns written paths."""
+def _normalize(contract) -> tuple[list, list]:
+    """(endpoints, shared_types) from either the dict shape {api_endpoints,
+    shared_types} or a bare endpoint list (the architect emits the latter)."""
+    if isinstance(contract, list):
+        return contract, []
+    if isinstance(contract, dict):
+        return contract.get("api_endpoints") or [], contract.get("shared_types") or []
+    return [], []
+
+
+def generate(contract, frontend_root: Path) -> list[Path]:
+    """Write src/api/{types,client}.ts under frontend_root. Robust to any
+    contract shape — never raises (a codegen crash must not kill BUILD)."""
+    endpoints, shared = _normalize(contract)
+    norm_shared = [{**t, "name": _strip_ns(t["name"])}
+                   for t in shared if isinstance(t, dict) and t.get("name")]
+    defined = {t["name"] for t in norm_shared}
+    types_ts = gen_types(norm_shared)
+    # Permissive placeholders for interfaces referenced by endpoints but not
+    # detailed in the contract (the architect keeps schemas in SEAMS/per-module).
+    # An index signature keeps property access type-checking under `tsc --strict`.
+    missing = [r for r in _referenced_types(endpoints) if r not in defined]
+    if missing:
+        types_ts += "\n// placeholders for schemas defined in backend modules\n"
+        types_ts += "\n".join(
+            f"export interface {m} {{ [key: string]: unknown; }}" for m in missing) + "\n"
     api_dir = Path(frontend_root) / "src" / "api"
     api_dir.mkdir(parents=True, exist_ok=True)
     types = api_dir / "types.ts"
     client = api_dir / "client.ts"
-    types.write_text(gen_types(contract.get("shared_types") or []), encoding="utf-8")
-    client.write_text(gen_client(contract.get("api_endpoints") or []), encoding="utf-8")
+    types.write_text(types_ts, encoding="utf-8")
+    client.write_text(gen_client(endpoints), encoding="utf-8")
     return [types, client]
 
 

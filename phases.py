@@ -47,9 +47,20 @@ def real_agents() -> dict:
     }
 
 
+_FRONTEND_HINTS = ("frontend", "react", "dashboard", "admin panel", "web ui",
+                   "web app", "user interface", " ui ", "single-page")
+
+
 def phase_intake(state: ProjectState, build_dir: Path, agents: dict) -> str:
     if not state.user_prompt.strip():
         raise ValueError("INTAKE: no user prompt — pass --prompt")
+    # Fail fast if the request implies a UI but the toolchain is absent (better
+    # here than after an hour of backend waves).
+    if any(k in state.user_prompt.lower() for k in _FRONTEND_HINTS):
+        import shutil
+        if not (shutil.which("node") and shutil.which("npm")):
+            raise ValueError("INTAKE: the prompt implies a frontend but node/npm "
+                             "are not on PATH — install Node.js and retry")
     (build_dir / "PROMPT.txt").write_text(state.user_prompt, encoding="utf-8")
     return f"saved prompt ({len(state.user_prompt)} chars)"
 

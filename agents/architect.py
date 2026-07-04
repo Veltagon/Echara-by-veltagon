@@ -75,7 +75,16 @@ the current directory with your file tool, then stop. Do not write any code.
 4. CONVENTIONS.md — the hard constraints every builder must follow (error
    handling pattern, DI via FastAPI Depends, one SQLAlchemy Base in core,
    services hold all DB logic, thin routers, bcrypt-direct auth, pagination
-   response shape, absolute imports, __init__.py in every package).{err}"""
+   response shape, absolute imports, __init__.py in every package).
+
+FRONTEND: if the request asks for a UI, ALSO include frontend module(s) in
+MODULES.json (kind "frontend", path_root under "code/frontend"), and write a
+FIFTH file CONTRACT_REGISTRY.json describing the API the frontend consumes:
+{{"api_endpoints": [{{"method","path","request_schema","response_schema",
+"auth_required"}}], "shared_types": [{{"name","fields","required"}}],
+"db_tables": [], "env_vars": [], "dependencies": []}}. The frontend client is
+generated from this file — it must be complete. If the request is backend-only,
+do NOT create a frontend module.{err}"""
 
 
 def validate_architecture(build_dir: Path) -> list[str]:

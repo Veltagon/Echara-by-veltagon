@@ -231,6 +231,18 @@ def _failing_modules(build_dir: Path) -> dict[str, list[dict]]:
     return routed
 
 
+_FRONTEND_RULES = """FRONTEND RULES (this is a frontend module):
+- Stack: Vite + React + TypeScript. package.json pins react + react-dom and
+  devDeps vite, typescript, @vitejs/plugin-react, @types/react, @types/react-dom.
+- The API client is ALREADY GENERATED at src/api/types.ts and src/api/client.ts.
+  Import types and fetch functions from there — NEVER redeclare API types or
+  hand-write fetch calls to the backend.
+- The API base URL is import.meta.env.VITE_API_URL (already wired in the
+  generated client). Never hardcode backend URLs.
+- tsconfig.json enables strict mode; `tsc --noEmit` and `vite build` must both
+  pass — no `any` escape hatch to silence type errors."""
+
+
 def _module_context(build_dir: Path, module: dict, seams: dict, conventions: str,
                     module_plan: str, skill_rel: str | None) -> str:
     """Flat, per-MODULE context (M5): CONVENTIONS + only the seams of THIS
@@ -239,6 +251,8 @@ def _module_context(build_dir: Path, module: dict, seams: dict, conventions: str
     is what keeps context constant from module 1 to module 16."""
     deps = module.get("depends_on", [])
     parts = [_NN_RULES]
+    if module.get("kind") == "frontend":
+        parts.append(_FRONTEND_RULES)
     if conventions.strip():
         parts.append("=== CONVENTIONS (obey exactly) ===\n" + conventions)
     dep_seams = {d: seams.get(d, []) for d in deps}
@@ -417,6 +431,13 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         seams = _read_json(build_dir / "SEAMS.json", {})
         conventions = _read_text(build_dir / "CONVENTIONS.md")
         modules = {m["name"]: m for m in architect.load_modules(build_dir)}
+        # Deterministically generate the frontend API client before any frontend
+        # module builds (the seam a model must never hand-write).
+        if any(m.get("kind") == "frontend" for m in modules.values()):
+            from agents import contract_codegen
+            written = contract_codegen.generate_from_build(build_dir)
+            if written:
+                log(f"builder: generated frontend API client ({len(written)} files)")
         n_passes = 0
         for mname in architect.module_order(build_dir):  # deps first
             m = modules[mname]

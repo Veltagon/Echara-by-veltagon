@@ -188,8 +188,34 @@ def _check_pytest(py: str, backend: Path, code_dir: Path, build_dir: Path) -> di
             "n_tests": n_tests, "failures": failures}
 
 
+def _check_frontend(build_dir: Path) -> dict | None:
+    """None when there is no frontend. Otherwise: npm install (cached) ->
+    tsc --noEmit -> vite build, all must pass (M5 frontend DoD)."""
+    fe = build_dir / "code" / "frontend"
+    if not fe.is_dir() or not (fe / "package.json").is_file():
+        return None
+    npm, npx = shutil.which("npm"), shutil.which("npx")
+    if not npm or not npx:
+        return {"passed": False, "detail": "node/npm not on PATH", "elapsed_sec": 0.0}
+    elapsed = 0.0
+    if not (fe / "node_modules").is_dir():  # cached across retries
+        ok, detail, e = _run([npm, "install", "--no-audit", "--no-fund"], fe, 900)
+        elapsed += e
+        if not ok:
+            return {"passed": False, "detail": "npm install failed\n" + detail, "elapsed_sec": elapsed}
+    ok, d1, e1 = _run([npx, "tsc", "--noEmit"], fe, 300)
+    elapsed += e1
+    if not ok:
+        return {"passed": False, "detail": "tsc --noEmit\n" + d1, "elapsed_sec": elapsed}
+    ok, d2, e2 = _run([npx, "vite", "build"], fe, 300)
+    elapsed += e2
+    return {"passed": ok, "detail": ("vite build\n" + d2) if not ok else "tsc + vite build ok",
+            "elapsed_sec": elapsed}
+
+
 def verify(build_dir: Path) -> dict:
-    """Run all 3 checks; write and return VERIFICATION_REPORT.json."""
+    """Run the backend checks (+ frontend when present); write and return
+    VERIFICATION_REPORT.json."""
     build_dir = Path(build_dir)
     code_dir = build_dir / "code"
     backend = _backend_root(code_dir)
@@ -202,6 +228,10 @@ def verify(build_dir: Path) -> dict:
     checks["pytest"] = (
         _check_pytest(py, backend, code_dir, build_dir) if checks["import_smoke"]["passed"]
         else {"passed": False, "detail": "skipped: import smoke failed", "elapsed_sec": 0.0})
+
+    frontend = _check_frontend(build_dir)  # None when there is no frontend
+    if frontend is not None:
+        checks["frontend"] = frontend
 
     report = {
         "verified": all(c["passed"] for c in checks.values()),

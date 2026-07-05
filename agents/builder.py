@@ -33,6 +33,13 @@ SINGLE_PASS_MAX = 12
 # Single-module builds (current pipeline) use this synthetic module name for the
 # deterministic interface index; Phase C replaces it with real MODULES.json names.
 _DEFAULT_MODULE = "app"
+# Cheap API build lanes (harness tool-calling, all verified 2026-07-05). Used
+# ONLY as OVERFLOW when both CLI lanes (claude, codex) are exhausted this round,
+# so a 5h quota wall degrades to slower-but-moving instead of parking for hours.
+# Order interleaves families (Cerebras / NVIDIA / HF) and the preferred lane
+# rotates per wave, so no single provider key gets hammered.
+_OVERFLOW_LANES = ["cerebras_gptoss", "nvidia_deepseek", "hf_qwen_coder",
+                   "hf_deepseek", "cerebras_gemma"]
 
 
 class BuildDispatchFailed(AgentDispatchError):
@@ -311,9 +318,50 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
     used: list[str] = []
     started = time.monotonic()
     consec = {"claude": 0, "codex": 0}  # consecutive failures per lane this build
+    oconsec = {n: 0 for n in _OVERFLOW_LANES}  # same, for the API overflow lanes
+    ostart = [0]                        # rotating overflow start → spread key load
+    DEAD_AFTER = 3
     wait_budget = [8 * 3600.0]          # seconds we may still park (M5 cap)
     _WAVE_MODEL = os.environ.get("ECHARA_WAVE_MODEL", "sonnet")  # tiering default
     _WAIT = os.environ.get("ECHARA_WAIT_ON_EXHAUST") == "1"
+
+    def _overflow(label: str, prompt: str) -> tuple[bool, list[str]]:
+        """Both CLI lanes are exhausted this round — fall through to the cheap API
+        build lanes (harness-driven tool-calling) instead of parking for hours.
+        The preferred lane rotates per wave so load spreads across the Cerebras /
+        HF / NVIDIA keys. Opt out with ECHARA_OVERFLOW=0. Returns (built?, fails)."""
+        if os.environ.get("ECHARA_OVERFLOW", "1") != "1":
+            return False, []
+        from providers import HARNESS_PROVIDERS
+        from run_harness_agent import run_harness
+        order = _OVERFLOW_LANES[ostart[0]:] + _OVERFLOW_LANES[:ostart[0]]
+        ostart[0] = (ostart[0] + 1) % len(_OVERFLOW_LANES)
+        ofail: list[str] = []
+        for name in order:
+            prov = HARNESS_PROVIDERS.get(name)
+            if prov is None or oconsec[name] >= DEAD_AFTER:
+                continue
+            log(f"builder: {label} -> OVERFLOW {name} ({prov.model})")
+            t0 = time.monotonic()
+            try:
+                report = run_harness(prov, prompt, build_dir, skills_dir=None,
+                                     full_access=False, max_rounds=30, log=lambda s: None)
+                ok = (report.get("stop_reason") in ("done", "stop")
+                      and report.get("tool_calls", 0) > 0)
+            except Exception as e:  # a dead key / transport error must not kill BUILD
+                report, ok = {"stop_reason": f"error:{type(e).__name__}"}, False
+            progress.metric_append(build_dir, {
+                "label": label, "lane": f"overflow:{name}", "model": prov.model,
+                "elapsed_sec": round(time.monotonic() - t0, 1),
+                "outcome": "ok" if ok else "fail"})
+            if ok:
+                oconsec[name] = 0
+                used.append(f"overflow:{name}")
+                return True, []
+            oconsec[name] += 1
+            ofail.append(f"overflow:{name}: {report.get('stop_reason')}")
+            log(f"builder: {ofail[-1]} (oconsec={oconsec[name]})")
+        return False, ofail
 
     def dispatch(label: str, prompt: str, model: str | None = None) -> None:
         """Run one pass on the first live lane. A lane is dead only after
@@ -322,7 +370,6 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
         reset and ECHARA_WAIT_ON_EXHAUST=1, park until the earliest reset (#10)."""
         from providers import PROVIDERS, availability
         (build_dir / f"BUILDER_PROMPT_{_slug(label)}.md").write_text(prompt, encoding="utf-8")
-        DEAD_AFTER = 3
         while True:
             failures = []
             for name in ("claude", "codex"):  # codex = spot-fix fallback lane
@@ -351,6 +398,11 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                     availability.mark_exhausted(name, time.time() + 60)
                 failures.append(f"{name}: exit={result.exit_code} kill={result.kill_reason}")
                 log(f"builder: {failures[-1]} (consec={consec[name]})")
+            # CLI lanes down this round → cheap API overflow before parking.
+            ok, ofail = _overflow(label, prompt)
+            if ok:
+                return
+            failures += ofail
             if _WAIT:
                 resets = [availability.status(n).resets_at for n in ("claude", "codex")
                           if consec[n] < DEAD_AFTER and availability.status(n).resets_at]

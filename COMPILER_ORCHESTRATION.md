@@ -75,10 +75,17 @@ harness tool-calling gate:
   fail the tool-calling gate — never route a build wave to them.
 - **Unfunded (billing, not capability):** z.ai, api.airforce, Vercel gateway.
 
-**Caching caveat (amends §1.2):** the `ALPHA` cached-prefix term assumes prompt
-caching. Anthropic/OpenAI cache; **Cerebras / HF-router / NVIDIA NIM caching is
-unconfirmed.** Until measured (0.5), budget the cheap lanes at `ALPHA = 1.0` (no
-cache) and read the 22.8-tok/LOC figure as a best case for the CLI lanes only.
+**Caching caveat (amends §1.2) — now partly MEASURED (2026-07-05, step-5
+instrumentation):** claude caches heavily (an instrumented smoke build read
+**758k cached vs 16k fresh input** across 3 dispatches). And crucially,
+**Cerebras `gpt-oss-120b` DOES cache — ~69% of input came back as `cached`
+(19,584 / 28,336)** — so the `ALPHA` flat-curve term likely holds for at least
+that API lane; the earlier "assume ALPHA=1.0 for cheap lanes" is too pessimistic
+for Cerebras. STILL to measure: HF-router / NVIDIA NIM caching (weren't exercised
+that run). Two known gaps: **codex CLI usage isn't parsed** (its stdout has no
+clean usage line) so it reads as 0; and per-lane `input` isn't apples-to-apples —
+claude `input` is the session-cumulative from its `result` message, the harness
+sums `usage` across tool-loop rounds.
 
 ## 0.3 Single-turn LEAF_GEN is a candidate, not the default
 

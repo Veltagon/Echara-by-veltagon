@@ -11,11 +11,33 @@ PROVIDERS: dict[str, type[Provider]] = {
 
 # M2.5 raw-API providers — driven by ECHARA's own harness/loop.py.
 # Additive: each row is base_url + .env key + model. Add upstreams here.
-# (gemma-4-31b is the only live Cerebras model that emits real tool_calls;
-#  gpt-oss-120b / zai-glm-4.7 route text into `reasoning` with content=None.)
+# Code-gen quality verified 3/3 (run-and-verify) for every model below on
+# 2026-07-05 (see scratchpad/provider_probe). Tool-calling capability — the gate
+# for using one as a BUILD lane — is verified separately through the harness.
 HARNESS_PROVIDERS: dict[str, OpenAICompatProvider] = {
+    # Cerebras (fast inference, ~1-3s; Cloudflare-fronted, needs the openai SDK).
     "cerebras_gemma": OpenAICompatProvider(
         "cerebras_gemma", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "gemma-4-31b"
+    ),
+    "cerebras_gptoss": OpenAICompatProvider(
+        "cerebras_gptoss", "https://api.cerebras.ai/v1", "CEREBRAS_API_KEYS", "gpt-oss-120b"
+    ),
+    # HuggingFace router (OpenAI-compatible; 119 live models).
+    "hf_qwen_coder": OpenAICompatProvider(
+        "hf_qwen_coder", "https://router.huggingface.co/v1", "HUGGINGFACE_TOKEN",
+        "Qwen/Qwen2.5-Coder-32B-Instruct"
+    ),
+    "hf_deepseek": OpenAICompatProvider(
+        "hf_deepseek", "https://router.huggingface.co/v1", "HUGGINGFACE_TOKEN",
+        "deepseek-ai/DeepSeek-V3-0324"
+    ),
+    # NVIDIA NIM (build.nvidia.com integrate endpoint; 3-key rotation pool).
+    # (mistralai/mistral-nemotron codes fine but NIM doesn't serve it with native
+    #  function-calling — it emits the tool call as TEXT, so it can't drive the
+    #  harness build loop; dropped as a build lane. deepseek-v4-flash tool-calls OK.)
+    "nvidia_deepseek": OpenAICompatProvider(
+        "nvidia_deepseek", "https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEYS",
+        "deepseek-ai/deepseek-v4-flash"
     ),
 }
 

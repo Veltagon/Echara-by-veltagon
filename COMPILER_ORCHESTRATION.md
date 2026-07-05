@@ -105,12 +105,17 @@ This spec is ~10× the current implementation. Do NOT implement it wholesale
 
 1. **DONE** — multi-provider fleet + overflow lanes (`agents/builder.py`
    `_OVERFLOW_LANES`, per-wave family rotation). The enabling substrate.
-2. **NEXT** — concurrent multi-lane router: run the API lanes in PARALLEL (not
-   just as fallback) for real N>2 throughput. Highest leverage; hits the quota
-   wall head-on. This is the first real piece of §2.
-3. Adopt §4.2's contract-based failure classifier into the existing REPAIR/retry
-   loop — deterministic, zero-token, and its inputs (`agents/interfaces.py` +
-   `SEAMS.json`) already exist.
+2. **DONE** — concurrent multi-lane module router (`agents/builder.py`,
+   `ECHARA_CONCURRENCY`, default 1). Independent modules of a topological layer
+   build in PARALLEL, each on its own lane; extra workers spill onto the API
+   fleet instead of queueing on the 2 CLI lanes; `progress.py` is lock-guarded so
+   the shared ledger/budget can't be corrupted. Module-granularity (worktree-free
+   — path_roots are disjoint); file-level §2.3 worktrees remain deferred. Proven
+   deterministically (parallel builds + dependency order); needs a LIVE multi-lane
+   run to validate at scale (per step 5).
+3. **NEXT** — §4.2's contract-based failure classifier into the existing
+   REPAIR/retry loop — deterministic, zero-token, and its inputs
+   (`agents/interfaces.py` + `SEAMS.json`) already exist.
 4. Minimal §5 lesson ledger (append-only `LESSONS.jsonl` → builder prompt), NOT
    the full promotion pipeline yet.
 5. **Instrument before trusting the math:** extend `BUILD_METRICS.json` to log

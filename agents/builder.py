@@ -14,11 +14,14 @@ waves; burning 90s per wave re-proving it is waste).
 """
 from __future__ import annotations
 
+import graphlib
 import json
 import os
 import py_compile
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agents import interfaces
@@ -324,6 +327,16 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
     wait_budget = [8 * 3600.0]          # seconds we may still park (M5 cap)
     _WAVE_MODEL = os.environ.get("ECHARA_WAVE_MODEL", "sonnet")  # tiering default
     _WAIT = os.environ.get("ECHARA_WAIT_ON_EXHAUST") == "1"
+    # Concurrent module building (§2 of COMPILER_ORCHESTRATION.md, module-level).
+    # 1 = today's exact sequential behaviour (default; zero risk). >1 = build
+    # independent modules of a topological layer in parallel, each on its own
+    # lane. _lock serializes all lane bookkeeping; _busy is the lanes a running
+    # worker holds (never two workers on one lane); _tls carries a per-worker
+    # preferred CLI lane so peers spread.
+    _CONCURRENCY = max(1, int(os.environ.get("ECHARA_CONCURRENCY", "1")))
+    _lock = threading.Lock()
+    _busy: set[str] = set()
+    _tls = threading.local()
 
     def _overflow(label: str, prompt: str) -> tuple[bool, list[str]]:
         """Both CLI lanes are exhausted this round — fall through to the cheap API
@@ -334,13 +347,16 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             return False, []
         from providers import HARNESS_PROVIDERS
         from run_harness_agent import run_harness
-        order = _OVERFLOW_LANES[ostart[0]:] + _OVERFLOW_LANES[:ostart[0]]
-        ostart[0] = (ostart[0] + 1) % len(_OVERFLOW_LANES)
+        with _lock:
+            order = _OVERFLOW_LANES[ostart[0]:] + _OVERFLOW_LANES[:ostart[0]]
+            ostart[0] = (ostart[0] + 1) % len(_OVERFLOW_LANES)
         ofail: list[str] = []
         for name in order:
             prov = HARNESS_PROVIDERS.get(name)
-            if prov is None or oconsec[name] >= DEAD_AFTER:
-                continue
+            with _lock:  # claim a free, live, non-busy API lane (peer-exclusive)
+                if prov is None or oconsec[name] >= DEAD_AFTER or name in _busy:
+                    continue
+                _busy.add(name)
             log(f"builder: {label} -> OVERFLOW {name} ({prov.model})")
             t0 = time.monotonic()
             try:
@@ -350,68 +366,101 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                       and report.get("tool_calls", 0) > 0)
             except Exception as e:  # a dead key / transport error must not kill BUILD
                 report, ok = {"stop_reason": f"error:{type(e).__name__}"}, False
+            finally:
+                with _lock:
+                    _busy.discard(name)
             progress.metric_append(build_dir, {
                 "label": label, "lane": f"overflow:{name}", "model": prov.model,
                 "elapsed_sec": round(time.monotonic() - t0, 1),
                 "outcome": "ok" if ok else "fail"})
-            if ok:
-                oconsec[name] = 0
-                used.append(f"overflow:{name}")
-                return True, []
-            oconsec[name] += 1
+            with _lock:
+                if ok:
+                    oconsec[name] = 0
+                    used.append(f"overflow:{name}")
+                    return True, []
+                oconsec[name] += 1
             ofail.append(f"overflow:{name}: {report.get('stop_reason')}")
             log(f"builder: {ofail[-1]} (oconsec={oconsec[name]})")
         return False, ofail
 
     def dispatch(label: str, prompt: str, model: str | None = None) -> None:
-        """Run one pass on the first live lane. A lane is dead only after
-        DEAD_AFTER consecutive failures (#9 — a single idle blip is a 60s
-        cooldown, not permadeath). When all lanes are exhausted with a known
-        reset and ECHARA_WAIT_ON_EXHAUST=1, park until the earliest reset (#10)."""
+        """Run one pass on a free live lane. Concurrency-safe: a CLI lane is
+        claimed under _lock (marked busy) and released after the model call, so
+        parallel module workers never share a lane. A dead lane (DEAD_AFTER
+        consecutive fails) or a lane held by a peer falls through to the cheap API
+        overflow fleet — that is what gives real N-way throughput: extra workers
+        build on API lanes instead of queueing on the 2 CLI lanes. Only when
+        NOTHING is free does it wait, then (ECHARA_WAIT_ON_EXHAUST=1) park to the
+        earliest reset. At ECHARA_CONCURRENCY=1 (_busy always empty) the
+        behaviour is byte-identical to the sequential builder."""
         from providers import PROVIDERS, availability
-        (build_dir / f"BUILDER_PROMPT_{_slug(label)}.md").write_text(prompt, encoding="utf-8")
+        with _lock:
+            (build_dir / f"BUILDER_PROMPT_{_slug(label)}.md").write_text(prompt, encoding="utf-8")
+        pref = getattr(_tls, "lane", None)
+        order = ([pref] if pref in ("claude", "codex") else []) + \
+                [n for n in ("claude", "codex") if n != pref]
         while True:
-            failures = []
-            for name in ("claude", "codex"):  # codex = spot-fix fallback lane
-                if consec[name] >= DEAD_AFTER:
-                    failures.append(f"{name}: dead ({DEAD_AFTER} consecutive)")
-                    continue
-                avail = availability.status(name)
-                if not avail.available:
-                    failures.append(f"{name}: cooldown {int(avail.seconds_until_reset)}s")
-                    continue
-                tag = f" ({model})" if name == "claude" and model else ""
-                log(f"builder: {label} -> {name}{tag}")
-                prov = PROVIDERS[name](model=model) if name == "claude" else PROVIDERS[name]()
-                result = prov.run(prompt, build_dir, ECHARA_ROOT / "logs", timeout_sec=1500)
+            failures, claimed, busy_live = [], None, False
+            with _lock:
+                for name in order:
+                    if consec[name] >= DEAD_AFTER:
+                        failures.append(f"{name}: dead ({DEAD_AFTER} consecutive)")
+                        continue
+                    avail = availability.status(name)
+                    if not avail.available:
+                        failures.append(f"{name}: cooldown {int(avail.seconds_until_reset)}s")
+                        continue
+                    if name in _busy:          # held by a peer worker → transient
+                        busy_live = True
+                        continue
+                    _busy.add(name)
+                    claimed = name
+                    break
+            if claimed:
+                tag = f" ({model})" if claimed == "claude" and model else ""
+                log(f"builder: {label} -> {claimed}{tag}")
+                prov = PROVIDERS[claimed](model=model) if claimed == "claude" else PROVIDERS[claimed]()
+                try:
+                    result = prov.run(prompt, build_dir, ECHARA_ROOT / "logs", timeout_sec=1500)
+                finally:
+                    with _lock:
+                        _busy.discard(claimed)
                 progress.metric_append(build_dir, {
-                    "label": label, "lane": name, "model": model or "default",
+                    "label": label, "lane": claimed, "model": model or "default",
                     "elapsed_sec": result.elapsed_sec, "outcome": "ok" if result.ok else "fail"})
-                if result.ok:
-                    consec[name] = 0
-                    used.append(name)
-                    return
-                consec[name] += 1
-                # Provider already marked a real quota reset; a plain blip (idle
-                # kill / exit 1) gets a short cooldown so the NEXT pass retries it.
-                if not result.rate_limit_retry_after_sec:
-                    availability.mark_exhausted(name, time.time() + 60)
-                failures.append(f"{name}: exit={result.exit_code} kill={result.kill_reason}")
-                log(f"builder: {failures[-1]} (consec={consec[name]})")
-            # CLI lanes down this round → cheap API overflow before parking.
+                with _lock:
+                    if result.ok:
+                        consec[claimed] = 0
+                        used.append(claimed)
+                        return
+                    consec[claimed] += 1
+                    # A real quota reset is already marked by the provider; a plain
+                    # blip (idle kill / exit 1) gets a 60s cooldown for the retry.
+                    if not result.rate_limit_retry_after_sec:
+                        availability.mark_exhausted(claimed, time.time() + 60)
+                log(f"builder: {claimed}: exit={result.exit_code} kill={result.kill_reason} "
+                    f"(consec={consec[claimed]})")
+                continue
+            # No free CLI lane (dead or peer-held) → the API overflow fleet. This
+            # is the concurrency win: N-2 extra workers build on distinct API lanes.
             ok, ofail = _overflow(label, prompt)
             if ok:
                 return
             failures += ofail
+            if busy_live:      # a CLI lane exists but is peer-held, no free API → wait
+                time.sleep(2)
+                continue
             if _WAIT:
-                resets = [availability.status(n).resets_at for n in ("claude", "codex")
-                          if consec[n] < DEAD_AFTER and availability.status(n).resets_at]
+                with _lock:
+                    resets = [availability.status(n).resets_at for n in ("claude", "codex")
+                              if consec[n] < DEAD_AFTER and availability.status(n).resets_at]
                 if resets:
                     wait = min(resets) - time.time()
                     if 0 < wait <= wait_budget[0]:
                         log(f"builder: all lanes exhausted — parking {int(wait)}s until reset")
                         time.sleep(wait + 5)
-                        wait_budget[0] -= wait
+                        with _lock:
+                            wait_budget[0] -= wait
                         continue
             raise BuildDispatchFailed(f"{label}: " + "; ".join(failures))
 
@@ -499,8 +548,13 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                     log(f"builder: generated frontend API client ({len(written)} files)")
             except Exception as e:  # noqa: BLE001 — never let codegen kill BUILD
                 log(f"builder: contract codegen skipped ({e!r})")
-        n_passes = 0
-        for mname in architect.module_order(build_dir):  # deps first
+        _np = [0]
+        _CLI = ("claude", "codex")
+
+        def _build_one(mname: str, lane_hint: int) -> None:
+            # Prefer a distinct CLI lane per concurrent worker so peers spread;
+            # dispatch still falls to the API fleet when this lane is taken.
+            _tls.lane = _CLI[lane_hint % len(_CLI)]
             m = modules[mname]
             mroot = build_dir / m["path_root"]
             plan_path = build_dir / f"PLAN_{mname}.md"
@@ -511,7 +565,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             def ctx_fn(m=m, plan_md=plan_md):
                 return _module_context(build_dir, m, seams, conventions, plan_md, skill_rel)
 
-            n_passes += build_module(mname, mroot, plan_md, ctx_fn, prog)
+            p = build_module(mname, mroot, plan_md, ctx_fn, prog)
             pm = progress.module_state(prog, mname)
 
             # Per-module integration (scoped to this module's tests) — replaces
@@ -523,7 +577,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                          _module_integration_prompt(mname, test_rel, ctx_fn()), model="opus")
                 interfaces.write_module_interface(build_dir, mname, mroot)
                 pm["integrated"] = True
-                n_passes += 1
+                p += 1
 
             # Deterministic seam check + ≤1 seam-fix/module.
             mism = interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
@@ -532,9 +586,32 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                 dispatch(f"{mname} seam-fix",
                          _fix_prompt("Declared exports missing:\n" + "\n".join(mism), ctx_fn()), model="opus")
                 interfaces.write_module_interface(build_dir, mname, mroot)
-                n_passes += 1
+                p += 1
             pm["seams_ok"] = not interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
             progress.save(build_dir, prog)
+            with _lock:
+                _np[0] += p
+
+        # Build in topological LAYERS: modules whose deps are all built become
+        # ready together and (ECHARA_CONCURRENCY>1) build in parallel, each on its
+        # own lane; dependents wait for their layer. Every dep's interface is on
+        # disk before a layer starts (ts.done runs after the layer completes), so
+        # a worker never reads a peer that is still being written. Sequential and
+        # byte-identical when _CONCURRENCY == 1.
+        ts = graphlib.TopologicalSorter(
+            {name: set(mm.get("depends_on", [])) for name, mm in modules.items()})
+        ts.prepare()
+        while ts.is_active():
+            ready = list(ts.get_ready())
+            if _CONCURRENCY > 1 and len(ready) > 1:
+                with ThreadPoolExecutor(max_workers=_CONCURRENCY) as ex:
+                    for f in [ex.submit(_build_one, mn, i) for i, mn in enumerate(ready)]:
+                        f.result()  # re-raise the first worker failure
+            else:
+                for i, mn in enumerate(ready):
+                    _build_one(mn, i)
+            ts.done(*ready)
+        n_passes = _np[0]
         # No final global integration — VERIFY is the cross-module gate; failures
         # route back per-module on retry.
     else:

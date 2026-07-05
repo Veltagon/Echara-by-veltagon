@@ -10,11 +10,18 @@ a fix dispatches so a crash can't reset the count and multiply retries.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 _PROGRESS = "BUILD_PROGRESS.json"
 _JOURNAL = "BUILD_JOURNAL.md"
 _METRICS = "BUILD_METRICS.json"
+
+# Re-entrant so record_fix (which calls module_state + save) can hold it across
+# nested calls. Serializes every shared write-through mutation + file write, so
+# the concurrent module builder (ECHARA_CONCURRENCY>1) can't corrupt these files
+# or double-count the global fix budget. Uncontended (no-op) at concurrency 1.
+_LOCK = threading.RLock()
 
 # Ceiling on fix dispatches across the whole build — the backstop against the
 # retry-multiplication worst case (M5 plan risk #4). Exhausted → the normal
@@ -33,31 +40,36 @@ def load(build_dir: Path) -> dict:
 
 
 def save(build_dir: Path, data: dict) -> None:
-    (Path(build_dir) / _PROGRESS).write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with _LOCK:
+        (Path(build_dir) / _PROGRESS).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def module_state(data: dict, module: str) -> dict:
-    return data["modules"].setdefault(
-        module, {"waves_done": 0, "gate_fixes": 0, "integration_fixes": 0,
-                 "seam_fixes": 0, "seams_ok": False, "integrated": False})
+    with _LOCK:  # setdefault must not race a concurrent save() iterating the dict
+        return data["modules"].setdefault(
+            module, {"waves_done": 0, "gate_fixes": 0, "integration_fixes": 0,
+                     "seam_fixes": 0, "seams_ok": False, "integrated": False})
 
 
 def can_fix(data: dict) -> bool:
     """True if the global fix budget still has room."""
-    return data.get("global_fix_budget_used", 0) < GLOBAL_FIX_BUDGET
+    with _LOCK:
+        return data.get("global_fix_budget_used", 0) < GLOBAL_FIX_BUDGET
 
 
 def record_fix(build_dir: Path, data: dict, module: str, kind: str) -> None:
     """Charge one fix against the global budget + the module counter, and
-    persist BEFORE the fix dispatches (crash-safe budget)."""
-    data["global_fix_budget_used"] = data.get("global_fix_budget_used", 0) + 1
-    module_state(data, module)[f"{kind}_fixes"] = \
-        module_state(data, module).get(f"{kind}_fixes", 0) + 1
-    save(build_dir, data)
+    persist BEFORE the fix dispatches (crash-safe budget). Atomic under _LOCK so
+    concurrent workers can't double-spend the shared budget."""
+    with _LOCK:
+        data["global_fix_budget_used"] = data.get("global_fix_budget_used", 0) + 1
+        module_state(data, module)[f"{kind}_fixes"] = \
+            module_state(data, module).get(f"{kind}_fixes", 0) + 1
+        save(build_dir, data)
 
 
 def journal_append(build_dir: Path, line: str) -> None:
-    with (Path(build_dir) / _JOURNAL).open("a", encoding="utf-8") as f:
+    with _LOCK, (Path(build_dir) / _JOURNAL).open("a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")
 
 
@@ -72,14 +84,15 @@ def metric_append(build_dir: Path, entry: dict) -> None:
     """Append one per-session record (lane/model/duration/outcome) for tuning
     and the delivery report."""
     p = Path(build_dir) / _METRICS
-    data = []
-    if p.is_file():
-        try:
-            data = json.loads(p.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = []
-    data.append(entry)
-    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with _LOCK:  # read-modify-write of a shared file — must be atomic across lanes
+        data = []
+        if p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = []
+        data.append(entry)
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def metrics(build_dir: Path) -> list[dict]:

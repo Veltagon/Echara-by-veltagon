@@ -231,16 +231,21 @@ where relevant). At least {_module_floor(module)} files.
 
 
 def _run_module_planner(prompt: str, build_dir: Path, module: dict, conventions: str,
-                        dep_seams: dict, errors: list[str] | None, log) -> None:
+                        dep_seams: dict, errors: list[str] | None, log,
+                        force_claude: bool = False) -> None:
     task = _module_task(prompt, module, conventions, dep_seams, errors)
-    try:
-        from providers import HARNESS_PROVIDERS
-        provider = HARNESS_PROVIDERS["cerebras_gemma"]
-        run_agent(provider, _SYSTEM, task, Context(workspace_root=build_dir.resolve()),
-                  max_rounds=6, log=log)
-        return
-    except Exception as e:  # noqa: BLE001 — harness down → claude fallback
-        log(f"planner[{module['name']}]: harness failed ({e!r}) — claude fallback")
+    if not force_claude:
+        try:
+            from providers import HARNESS_PROVIDERS
+            provider = HARNESS_PROVIDERS["cerebras_gemma"]
+            run_agent(provider, _SYSTEM, task, Context(workspace_root=build_dir.resolve()),
+                      max_rounds=6, log=log)
+            return
+        except Exception as e:  # noqa: BLE001 — harness down → claude fallback
+            log(f"planner[{module['name']}]: harness failed ({e!r}) — claude fallback")
+    # claude CLI: a forced fallback (gemma ran but produced no valid plan) or the
+    # harness being down. Handles big-context modules — an app-assembly module
+    # that depends on every other — which gemma-4-31b can't plan reliably.
     from providers import PROVIDERS
     PROVIDERS["claude"]().run(
         _SYSTEM + "\n\n" + task + "\n\nWrite the file now; do not narrate.",
@@ -260,12 +265,14 @@ def _run_module_planners(prompt: str, build_dir: Path, log) -> dict:
             continue  # already planned + valid (cheap resume)
         dep_seams = {d: seams.get(d, []) for d in m.get("depends_on", [])}
         errors: list[str] | None = None
-        for _ in range(2):  # primary + one error-fed retry
-            _run_module_planner(prompt, build_dir, m, conventions, dep_seams, errors, log)
+        for attempt in range(3):  # 2 gemma attempts, then a forced claude-CLI fallback
+            _run_module_planner(prompt, build_dir, m, conventions, dep_seams, errors, log,
+                                force_claude=(attempt == 2))
             errors = _validate_module_plan(build_dir, m)
             if not errors:
                 break
-            log(f"planner: module {m['name']} rejected: {errors}")
+            log(f"planner: module {m['name']} rejected: {errors}"
+                + (" — claude fallback next" if attempt == 1 else ""))
         if errors:
             raise PlanFailed(f"module {m['name']}: {errors}")
         planned += 1

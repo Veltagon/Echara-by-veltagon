@@ -501,21 +501,36 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
     if last_error and is_multi:
         # Route the failure per-module (from junitxml) and fix each owner in its
         # own scoped context — lifetime budget ≤2 integration-fixes/module.
-        from agents import architect
+        from agents import architect, classifier
         seams = _read_json(build_dir / "SEAMS.json", {})
         conv = _read_text(build_dir / "CONVENTIONS.md")
         modules = {m["name"]: m for m in architect.load_modules(build_dir)}
-        routed = _failing_modules(build_dir)
-        real = {k: v for k, v in routed.items() if k in modules}
+        prefixes = {n: _module_prefix(m["path_root"]) for n, m in modules.items()}
+        iface_names = classifier.interface_names(build_dir, list(modules))
+        # §4.2: contract-classify every failure and route the fix to the REAL
+        # culprit — the PROVIDER on an interface breach, the CONSUMER (test owner)
+        # on a hallucination/local bug. Fault comes from SEAMS.json, so blame
+        # can't oscillate. The fix prompt carries the [STATE] + reason.
+        by_target: dict[str, list[tuple[dict, dict]]] = {}
+        for owner, fails in _failing_modules(build_dir).items():
+            oc = owner if owner in modules else None
+            for f in fails:
+                r = classifier.classify(f, oc, seams, iface_names, prefixes)
+                tgt = r["target"] if r["target"] in modules else oc
+                if tgt:
+                    by_target.setdefault(tgt, []).append((f, r))
         n_passes = 0
-        if real:
-            for mname, fails in real.items():
+        if by_target:
+            for mname, items in by_target.items():
                 pm = progress.module_state(prog, mname)
                 if pm.get("integration_fixes", 0) >= 2 or not progress.can_fix(prog):
                     log(f"builder: {mname} integration-fix budget spent — skip")
                     continue
                 progress.record_fix(build_dir, prog, mname, "integration")
-                err = "\n".join(f"{x['file']}::{x['test']}: {x['message']}" for x in fails)
+                err = "\n".join(
+                    f"[{r['state']}] {f['file']}::{f['test']}: {f['message']}\n  → {r['reason']}"
+                    for f, r in items)
+                log(f"builder: {mname} fix — {', '.join(sorted({r['state'] for _, r in items}))}")
                 ctx = _module_context(build_dir, modules[mname], seams, conv, "", skill_rel)
                 dispatch(f"{mname} fix", _fix_prompt(err, ctx), model="opus")
                 interfaces.write_module_interface(build_dir, mname, build_dir / modules[mname]["path_root"])

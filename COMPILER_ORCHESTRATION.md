@@ -113,11 +113,16 @@ This spec is ~10× the current implementation. Do NOT implement it wholesale
    — path_roots are disjoint); file-level §2.3 worktrees remain deferred. Proven
    deterministically (parallel builds + dependency order); needs a LIVE multi-lane
    run to validate at scale (per step 5).
-3. **NEXT** — §4.2's contract-based failure classifier into the existing
-   REPAIR/retry loop — deterministic, zero-token, and its inputs
-   (`agents/interfaces.py` + `SEAMS.json`) already exist.
-4. Minimal §5 lesson ledger (append-only `LESSONS.jsonl` → builder prompt), NOT
-   the full promotion pipeline yet.
+3. **DONE** — §4.2 contract-based failure classifier (`agents/classifier.py`),
+   wired into the builder's multi-module retry branch. Each VERIFY failure is
+   classified against `SEAMS.json` into LOCAL_BUG / INTERFACE_BREACH /
+   UPSTREAM_HALLUCINATION and the fix routes to the real culprit — the PROVIDER
+   on a breach, the CONSUMER (test owner) otherwise — with the state + reason in
+   the fix prompt. Conservative: only a high-confidence breach re-routes off the
+   owner. Module-granularity; signature-mismatch call-site resolution needs the
+   file DAG (§2.1, deferred) and falls back to LOCAL.
+4. **NEXT** — minimal §5 lesson ledger (append-only `LESSONS.jsonl` → builder
+   prompt), NOT the full promotion pipeline yet.
 5. **Instrument before trusting the math:** extend `BUILD_METRICS.json` to log
    per-invocation input/output/cache tokens; run E1/E2; CONFIRM the flat curve
    and whether the fleet caches BEFORE building §1.3's REJECT enforcement.

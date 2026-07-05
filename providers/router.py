@@ -31,7 +31,7 @@ def _looks_rate_limited(e: BaseException) -> bool:
     return "429" in s or "ratelimit" in s.replace(" ", "").replace("_", "")
 
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = ECHARA_ROOT / "provider_config.yaml"
+DEFAULT_CONFIG = ECHARA_ROOT / "config" / "provider_config.yaml"
 
 _ENV_REF = re.compile(r"^\$\{([^}]+)\}$")
 

@@ -1,6 +1,6 @@
 """Unit tests for the M2.5 harness — no API spend.
 
-Run: python tests_m25_harness.py
+Run: python tests/tests_m25_harness.py
 Exits 0 only if every check passes. Mirrors tests_hardening.py's plain-stdlib
 style. The loop is exercised end-to-end with a SCRIPTED fake provider, so the
 real tools (write_file, bash_run) actually run against a temp workspace.
@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root importable
 from harness import safety, skills, tools, registry
 from harness.loop import run_agent
 from harness.tools import Context

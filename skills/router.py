@@ -15,7 +15,7 @@ from skills.loader import SkillLoader, count_tokens
 
 ECHARA_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_POOL_ROOT = ECHARA_ROOT / "skills-pool" / "engineering-team" / "skills"
-DEFAULT_ASSIGNMENTS = ECHARA_ROOT / "skill_assignments.yaml"
+DEFAULT_ASSIGNMENTS = ECHARA_ROOT / "config" / "skill_assignments.yaml"
 
 TOKEN_BUDGET = 5000
 MAX_SKILLS_PER_ROLE = 4

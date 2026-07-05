@@ -1,6 +1,6 @@
 """Unit tests for the M2 hardening — no API spend.
 
-Run: python tests_hardening.py
+Run: python tests/tests_hardening.py
 Each test prints PASS/FAIL and the script exits 0 only if every test passes.
 """
 from __future__ import annotations
@@ -10,12 +10,13 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root importable
 from providers import availability
 from providers.base import _filter_noise, NOISE_PATTERNS, Provider
 from providers.codex import _acquire_slot, _parse_retry_after, _release_slot
 
 
-SCRATCH = Path(__file__).parent / "logs" / "_test_scratch"
+SCRATCH = Path(__file__).resolve().parent.parent / "logs" / "_test_scratch"
 
 
 _results: list[tuple[str, bool, str]] = []

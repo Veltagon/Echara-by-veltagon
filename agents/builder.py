@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from agents import interfaces
+from agents import lessons
 from agents import progress
 from skills import router as skills_router
 from harness import skills as skills_stage
@@ -137,6 +138,9 @@ def _wave_context(build_dir: Path, module: str, deps: list[str], plan_md: str,
             "these, do NOT re-read or redeclare them) ===\n" + iface)
     parts.append("=== PLAN.md ===\n" + plan_md)
     parts.append("=== CONTRACT_REGISTRY.json ===\n" + contract)
+    less = lessons.for_prompt(build_dir, module)
+    if less:
+        parts.append(less)
     if journal_tail.strip():
         parts.append("=== BUILD JOURNAL (recent decisions) ===\n" + journal_tail)
     if skill_rel:
@@ -278,6 +282,9 @@ def _module_context(build_dir: Path, module: dict, seams: dict, conventions: str
                      "from these) ===\n" + iface)
     if module_plan.strip():
         parts.append(f"=== THIS MODULE ({module.get('name')}) PLAN ===\n" + module_plan)
+    less = lessons.for_prompt(build_dir, module.get("name", ""))
+    if less:
+        parts.append(less)
     journal = progress.journal_tail(build_dir)
     if journal.strip():
         parts.append("=== BUILD JOURNAL (recent decisions) ===\n" + journal)
@@ -531,6 +538,10 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                     f"[{r['state']}] {f['file']}::{f['test']}: {f['message']}\n  → {r['reason']}"
                     for f, r in items)
                 log(f"builder: {mname} fix — {', '.join(sorted({r['state'] for _, r in items}))}")
+                _st = {"INTERFACE_BREACH": "breach", "UPSTREAM_HALLUCINATION": "hallucination"}
+                for f, r in items:  # learn each classified fault as a within-build guardrail
+                    lessons.record(build_dir, mname, symptom=f.get("message", ""), fix=r["reason"],
+                                   tags=lessons.tags_from(f.get("message", ""), [_st.get(r["state"], "import")]))
                 ctx = _module_context(build_dir, modules[mname], seams, conv, "", skill_rel)
                 dispatch(f"{mname} fix", _fix_prompt(err, ctx), model="opus")
                 interfaces.write_module_interface(build_dir, mname, build_dir / modules[mname]["path_root"])
@@ -598,6 +609,11 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             mism = interfaces.check_seams(build_dir, {mname: seams.get(mname, [])})
             if mism and pm.get("seam_fixes", 0) < 1 and progress.can_fix(prog):
                 progress.record_fix(build_dir, prog, mname, "seam")
+                lessons.record(build_dir, mname,  # forward-pass seam-discipline guardrail
+                               symptom="declared seam(s) missing from this module's interface: "
+                               + ", ".join(mism),
+                               fix="export EXACTLY the symbols SEAMS.json declares for this module",
+                               tags=["seam"])
                 dispatch(f"{mname} seam-fix",
                          _fix_prompt("Declared exports missing:\n" + "\n".join(mism), ctx_fn()), model="opus")
                 interfaces.write_module_interface(build_dir, mname, mroot)

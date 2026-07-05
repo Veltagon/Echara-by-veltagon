@@ -121,11 +121,18 @@ This spec is ~10× the current implementation. Do NOT implement it wholesale
    the fix prompt. Conservative: only a high-confidence breach re-routes off the
    owner. Module-granularity; signature-mismatch call-site resolution needs the
    file DAG (§2.1, deferred) and falls back to LOCAL.
-4. **NEXT** — minimal §5 lesson ledger (append-only `LESSONS.jsonl` → builder
-   prompt), NOT the full promotion pipeline yet.
-5. **Instrument before trusting the math:** extend `BUILD_METRICS.json` to log
-   per-invocation input/output/cache tokens; run E1/E2; CONFIRM the flat curve
-   and whether the fleet caches BEFORE building §1.3's REJECT enforcement.
+4. **DONE** — minimal §5 lesson ledger (`agents/lessons.py`, append-only
+   `LESSONS.jsonl`). Each classified fix and forward-pass seam miss is recorded
+   as a "symptom → fix" guardrail; relevant lessons (own module + shared
+   framework/discipline tags, newest-first, ~600-token cap) are injected into
+   later wave/fix prompts (`_module_context` / `_wave_context`) so the build
+   stops repeating a mistake. Within-build only; the full §5.3 evidence-gated
+   promotion pipeline (lessons → repairs/NN-rules, cross-build, human-gated)
+   stays deferred — but the JSONL records are shaped to extend into it.
+5. **NEXT** — **instrument before trusting the math:** extend
+   `BUILD_METRICS.json` to log per-invocation input/output/cache tokens; run
+   E1/E2; CONFIRM the flat curve and whether the fleet caches BEFORE building
+   §1.3's REJECT enforcement.
 
 DEFER until 2–5 prove out and quota supports concurrency: single-turn LEAF_GEN,
 6-lane git-worktree parallelism (§2.3), sub-file lock ranges.

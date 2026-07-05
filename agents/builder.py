@@ -379,6 +379,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             progress.metric_append(build_dir, {
                 "label": label, "lane": f"overflow:{name}", "model": prov.model,
                 "elapsed_sec": round(time.monotonic() - t0, 1),
+                "usage": report.get("usage", {}) if isinstance(report, dict) else {},
                 "outcome": "ok" if ok else "fail"})
             with _lock:
                 if ok:
@@ -434,7 +435,8 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                         _busy.discard(claimed)
                 progress.metric_append(build_dir, {
                     "label": label, "lane": claimed, "model": model or "default",
-                    "elapsed_sec": result.elapsed_sec, "outcome": "ok" if result.ok else "fail"})
+                    "elapsed_sec": result.elapsed_sec, "usage": result.usage,
+                    "outcome": "ok" if result.ok else "fail"})
                 with _lock:
                     if result.ok:
                         consec[claimed] = 0

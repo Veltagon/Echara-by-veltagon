@@ -98,6 +98,21 @@ def delivery_report(build_dir: Path) -> str:
         lines.append(f"- model tiers used: {', '.join(models)}")
         lines.append("")
 
+    # Token model (§1 instrumentation): per-lane input/output/cached. Answers the
+    # §0.2 caching question and whether per-invocation input stays flat with S.
+    tks = progress.token_summary(build_dir)
+    if tks["total"]["input"] or tks["total"]["output"]:
+        t = tks["total"]
+        lines.append("## Tokens (per-invocation)")
+        lines.append(f"- total: input={t['input']:,} output={t['output']:,} "
+                     f"cached={t['cached']:,} cache_creation={t['cache_creation']:,}")
+        lines.append("| lane | invocations | avg input | total input | output | cached |")
+        lines.append("|---|---|---|---|---|---|")
+        for lane, l in sorted(tks["by_lane"].items()):
+            lines.append(f"| {lane} | {l['n']} | {l['avg_input']} | {l['input']:,} | "
+                         f"{l['output']:,} | {l['cached']:,} |")
+        lines.append("")
+
     # Journal digest (tail).
     tail = progress.journal_tail(build_dir, n=40)
     if tail:

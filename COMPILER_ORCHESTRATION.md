@@ -129,10 +129,18 @@ This spec is ~10× the current implementation. Do NOT implement it wholesale
    stops repeating a mistake. Within-build only; the full §5.3 evidence-gated
    promotion pipeline (lessons → repairs/NN-rules, cross-build, human-gated)
    stays deferred — but the JSONL records are shaped to extend into it.
-5. **NEXT** — **instrument before trusting the math:** extend
-   `BUILD_METRICS.json` to log per-invocation input/output/cache tokens; run
-   E1/E2; CONFIRM the flat curve and whether the fleet caches BEFORE building
-   §1.3's REJECT enforcement.
+5. **INSTRUMENTATION DONE; measurement pending.** `BUILD_METRICS.json` now logs
+   per-invocation `{input, output, cached, cache_creation}` for both lanes —
+   parsed from claude's stream-json `result` (CLI) and the OpenAI `resp.usage`
+   summed across harness rounds (API fleet). `progress.token_summary()` +
+   the DELIVERY_REPORT "## Tokens" table expose per-lane avg-input and cached, so
+   a real build empirically answers §0.2 ("does the fleet cache the frozen
+   prefix?") and §1's flat-curve claim. STILL PENDING: run E1/E2 to READ those
+   numbers and CONFIRM before building §1.3's REJECT_BEFORE_DISPATCH enforcement.
+
+Remaining big deferred pieces (after step 5's measurement): file-DAG §2.1, the
+§1.3 token allocator + enforcement, 6-lane git-worktree parallelism §2.3, and
+the §5.3 evidence-gated lesson-promotion pipeline.
 
 DEFER until 2–5 prove out and quota supports concurrency: single-turn LEAF_GEN,
 6-lane git-worktree parallelism (§2.3), sub-file lock ranges.

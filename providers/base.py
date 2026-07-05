@@ -42,6 +42,7 @@ class RunResult:
     kill_reason: str | None = None  # "timeout" | "idle" | None
     rate_limit_retry_after_sec: float | None = None
     skipped_reason: str | None = None  # set when run never spawned (slot/exhaust)
+    usage: dict = field(default_factory=dict)  # {input,output,cached,cache_creation} if parseable
 
     @property
     def ok(self) -> bool:

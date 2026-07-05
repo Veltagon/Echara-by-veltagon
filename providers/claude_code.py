@@ -7,6 +7,7 @@ can park until the quota window resets.
 """
 from __future__ import annotations
 
+import json
 import re
 import time
 from datetime import datetime, timedelta
@@ -22,6 +23,28 @@ CLAUDE_TEST_CONFIG_DIR = str(Path.home() / ".claude-test")
 # time in the account's tz, which matches the machine tz. Parse to a reset ts.
 _RESET_RE = re.compile(r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"(session|usage|weekly)\s+limit|hit your .*limit", re.IGNORECASE)
+
+
+def _parse_usage(stdout_path: Path) -> dict:
+    """Token usage from the final stream-json 'result' message (cumulative for
+    the session). {} if unparseable. Feeds §1 token-model instrumentation."""
+    try:
+        lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for line in reversed(lines):  # the result message is the last line
+        if '"result"' not in line:
+            continue
+        try:
+            u = json.loads(line).get("usage", {}) or {}
+        except json.JSONDecodeError:
+            continue
+        if u:
+            return {"input": u.get("input_tokens", 0) or 0,
+                    "output": u.get("output_tokens", 0) or 0,
+                    "cached": u.get("cache_read_input_tokens", 0) or 0,
+                    "cache_creation": u.get("cache_creation_input_tokens", 0) or 0}
+    return {}
 
 
 def _parse_reset(text: str, now: datetime | None = None) -> float | None:
@@ -85,4 +108,5 @@ class ClaudeCodeProvider(Provider):
             if reset:
                 availability.mark_exhausted(self.name, reset)
                 result.rate_limit_retry_after_sec = max(0.0, reset - time.time())
+        result.usage = _parse_usage(result.stdout_path)
         return result

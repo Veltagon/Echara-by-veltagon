@@ -22,6 +22,29 @@ class LoopResult:
     tool_calls: int
     stop_reason: str  # "done" | "stop" | "max_rounds" | "error"
     transcript: list[dict] = field(default_factory=list)
+    usage: dict = field(default_factory=dict)  # summed {input,output,cached} across rounds
+
+
+def _val(obj, key):
+    v = getattr(obj, key, None)
+    if v is None and isinstance(obj, dict):
+        v = obj.get(key)
+    return v or 0
+
+
+def _acc_usage(acc: dict, resp) -> None:
+    """Add one response's token usage (OpenAI-compatible) into acc. Whether the
+    provider reports cached tokens is exactly the §0.2 caching question."""
+    u = getattr(resp, "usage", None)
+    if u is None:
+        return
+    acc["input"] += _val(u, "prompt_tokens")
+    acc["output"] += _val(u, "completion_tokens")
+    det = getattr(u, "prompt_tokens_details", None)
+    if det is None and isinstance(u, dict):
+        det = u.get("prompt_tokens_details")
+    if det is not None:
+        acc["cached"] += _val(det, "cached_tokens")
 
 
 def _assistant_dict(msg) -> dict:
@@ -55,6 +78,7 @@ def run_agent(
     ]
     total_calls = 0
     final_text = ""
+    usage = {"input": 0, "output": 0, "cached": 0}
 
     for rnd in range(1, max_rounds + 1):
         try:
@@ -63,7 +87,8 @@ def run_agent(
             # errors; a raise here is terminal. End the run cleanly instead of
             # crashing the process, so the caller still gets a report.
             log(f"round {rnd}: API error, aborting: {e}")
-            return LoopResult(f"API error: {e}", rnd, total_calls, "error", messages)
+            return LoopResult(f"API error: {e}", rnd, total_calls, "error", messages, usage)
+        _acc_usage(usage, resp)
         msg = resp.choices[0].message
         # Some models route assistant text into `reasoning` with content=None.
         text = (getattr(msg, "reasoning", None) or msg.content or "").strip()
@@ -72,7 +97,7 @@ def run_agent(
         calls = getattr(msg, "tool_calls", None) or []
         if not calls:
             log(f"round {rnd}: stop (no tool calls)")
-            return LoopResult(text, rnd, total_calls, "stop", messages)
+            return LoopResult(text, rnd, total_calls, "stop", messages, usage)
 
         finished_summary = None
         for tc in calls:
@@ -92,9 +117,9 @@ def run_agent(
             )
 
         if finished_summary is not None:
-            return LoopResult(finished_summary, rnd, total_calls, "done", messages)
+            return LoopResult(finished_summary, rnd, total_calls, "done", messages, usage)
 
-    return LoopResult(final_text, max_rounds, total_calls, "max_rounds", messages)
+    return LoopResult(final_text, max_rounds, total_calls, "max_rounds", messages, usage)
 
 
 def _brief(s: str | None, n: int = 80) -> str:

@@ -103,3 +103,25 @@ def metrics(build_dir: Path) -> list[dict]:
         return json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return []
+
+
+def token_summary(build_dir: Path) -> dict:
+    """Aggregate per-invocation token usage from BUILD_METRICS: {total, by_lane}.
+    The per-lane 'cached' figure is the empirical answer to the §0.2 question —
+    does the API fleet (Cerebras / HF / NVIDIA) actually cache the frozen prefix?
+    'avg_input' per lane tests §1's flat-curve claim (should not grow with S)."""
+    tot = {"input": 0, "output": 0, "cached": 0, "cache_creation": 0}
+    by_lane: dict[str, dict] = {}
+    for e in metrics(build_dir):
+        u = e.get("usage") or {}
+        for k in tot:
+            tot[k] += u.get(k, 0) or 0
+        ln = by_lane.setdefault(e.get("lane", "?"),
+                                {"input": 0, "output": 0, "cached": 0, "n": 0})
+        ln["input"] += u.get("input", 0) or 0
+        ln["output"] += u.get("output", 0) or 0
+        ln["cached"] += u.get("cached", 0) or 0
+        ln["n"] += 1
+    for ln in by_lane.values():
+        ln["avg_input"] = round(ln["input"] / ln["n"], 1) if ln["n"] else 0
+    return {"total": tot, "by_lane": by_lane}

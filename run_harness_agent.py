@@ -84,6 +84,7 @@ def run_harness(
         "rounds": result.rounds,
         "tool_calls": result.tool_calls,
         "elapsed_sec": elapsed,
+        "usage": result.usage,
         "final_text": result.final_text,
     }
     (workspace / "HARNESS_REPORT.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

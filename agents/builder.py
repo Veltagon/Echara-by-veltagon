@@ -368,7 +368,7 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             t0 = time.monotonic()
             try:
                 report = run_harness(prov, prompt, build_dir, skills_dir=None,
-                                     full_access=False, max_rounds=30, log=lambda s: None)
+                                     full_access=False, max_rounds=60, log=lambda s: None)
                 ok = (report.get("stop_reason") in ("done", "stop")
                       and report.get("tool_calls", 0) > 0)
             except Exception as e:  # a dead key / transport error must not kill BUILD

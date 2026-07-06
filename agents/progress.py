@@ -10,6 +10,7 @@ a fix dispatches so a crash can't reset the count and multiply retries.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -26,7 +27,10 @@ _LOCK = threading.RLock()
 # Ceiling on fix dispatches across the whole build — the backstop against the
 # retry-multiplication worst case (M5 plan risk #4). Exhausted → the normal
 # VerifyFailed / MAX_RETRIES path takes over.
-GLOBAL_FIX_BUDGET = 25
+# 25 was sized for small builds; a 16-module ERP (E3-v2, 2026-07-06) exhausted it
+# before the frontend even started. Scale it and make it tunable per build — a
+# large build legitimately needs ~2-3 fixes/module. Default fits ~16-20 modules.
+GLOBAL_FIX_BUDGET = int(os.environ.get("ECHARA_FIX_BUDGET", "50"))
 
 
 def load(build_dir: Path) -> dict:

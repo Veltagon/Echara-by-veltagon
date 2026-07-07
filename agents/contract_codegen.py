@@ -55,7 +55,10 @@ def gen_types(shared_types: list[dict]) -> str:
 
 
 def _fn_name(method: str, path: str) -> str:
-    parts = [p for p in re.split(r"[/{}]", path) if p and p != "api"]
+    # Split on ANY non-alphanumeric (/, {}, and crucially '-', '_', '.') so a
+    # path segment like 'outstanding-invoices' becomes 'OutstandingInvoices' — a
+    # valid JS identifier — instead of a hyphenated one that fails tsc (TS1005).
+    parts = [p for p in re.split(r"[^A-Za-z0-9]", path) if p and p != "api"]
     camel = "".join(w[:1].upper() + w[1:] for w in parts)
     return method.lower() + camel
 

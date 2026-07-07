@@ -545,7 +545,11 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
                     lessons.record(build_dir, mname, symptom=f.get("message", ""), fix=r["reason"],
                                    tags=lessons.tags_from(f.get("message", ""), [_st.get(r["state"], "import")]))
                 ctx = _module_context(build_dir, modules[mname], seams, conv, "", skill_rel)
-                dispatch(f"{mname} fix", _fix_prompt(err, ctx), model="opus")
+                try:
+                    dispatch(f"{mname} fix", _fix_prompt(err, ctx), model="opus")
+                except BuildDispatchFailed:
+                    progress.refund_fix(build_dir, prog, mname, "integration")  # no lane ≠ a fix
+                    raise
                 interfaces.write_module_interface(build_dir, mname, build_dir / modules[mname]["path_root"])
                 n_passes += 1
             progress.save(build_dir, prog)
@@ -601,8 +605,12 @@ def run_builder(build_dir: Path, last_error: str = "", log=lambda s: None) -> di
             if (mroot / "tests").is_dir() and not pm.get("integrated") and progress.can_fix(prog):
                 progress.record_fix(build_dir, prog, mname, "integration")
                 test_rel = _module_prefix(m["path_root"]).replace(".", "/") + "/tests"
-                dispatch(f"{mname} integrate",
-                         _module_integration_prompt(mname, test_rel, ctx_fn()), model="opus")
+                try:
+                    dispatch(f"{mname} integrate",
+                             _module_integration_prompt(mname, test_rel, ctx_fn()), model="opus")
+                except BuildDispatchFailed:
+                    progress.refund_fix(build_dir, prog, mname, "integration")  # no lane ≠ a fix
+                    raise
                 interfaces.write_module_interface(build_dir, mname, mroot)
                 pm["integrated"] = True
                 p += 1

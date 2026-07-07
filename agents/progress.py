@@ -72,6 +72,18 @@ def record_fix(build_dir: Path, data: dict, module: str, kind: str) -> None:
         save(build_dir, data)
 
 
+def refund_fix(build_dir: Path, data: dict, module: str, kind: str) -> None:
+    """Reverse a record_fix charge when the fix never actually ran — a dispatch
+    that died for lack of a live lane is infra death, not a fix attempt. Without
+    this, a quota-stalled module re-charges the budget on every operator resume
+    (E3-v2: frontend_operations spent 15 'fixes' never integrating). Floors at 0."""
+    with _LOCK:
+        data["global_fix_budget_used"] = max(0, data.get("global_fix_budget_used", 0) - 1)
+        st = module_state(data, module)
+        st[f"{kind}_fixes"] = max(0, st.get(f"{kind}_fixes", 0) - 1)
+        save(build_dir, data)
+
+
 def journal_append(build_dir: Path, line: str) -> None:
     with _LOCK, (Path(build_dir) / _JOURNAL).open("a", encoding="utf-8") as f:
         f.write(line.rstrip() + "\n")

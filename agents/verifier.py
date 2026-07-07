@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import py_compile
+import re
 import shutil
 import subprocess
 import sys
@@ -87,9 +88,17 @@ def _provision_venv(build_dir: Path, backend: Path) -> tuple[str, str]:
                 or stamp.read_text(encoding="utf-8") != reqs_text
             if need_install:
                 argv = [str(py), "-m", "pip", "install", "--quiet",
-                        "pytest", "pytest-asyncio", "httpx", "alembic"]
-                if reqs.is_file():
+                        "pytest", "pytest-asyncio", "pytest-timeout", "httpx", "alembic"]
+                if reqs.is_file() and reqs_text.strip():
                     argv += ["-r", str(reqs)]
+                else:
+                    # No usable requirements.txt (E3-v2 shipped a 0-byte one, so
+                    # NOTHING installed -> app can't import -> a false verify
+                    # failure on 877-passing code). Install a base FastAPI stack so
+                    # the app still imports and the tests can actually run.
+                    argv += ["fastapi", "pydantic", "pydantic-settings", "sqlalchemy",
+                             "python-jose[cryptography]", "pyjwt", "python-multipart",
+                             "bcrypt", "email-validator"]
                 # If a build pins an old Rust-based dep with no wheel for a very
                 # new runtime Python (2026-07-04: pydantic 2.9 / pydantic-core
                 # uses PyUnicode_DATA, removed in the Py3.14 C API — unbuildable
@@ -104,9 +113,42 @@ def _provision_venv(build_dir: Path, backend: Path) -> tuple[str, str]:
     return sys.executable, f"venv provisioning failed ({last_err!r:.120}) — using orchestrator python"
 
 
+_APP_SKIP = frozenset({"__pycache__", ".verify_venv", ".venv", "node_modules", "alembic"})
+
+
+def _discover_app_import(backend: Path) -> str:
+    """The import that loads the ASGI app. The Architect is free to place it at
+    app/main.py, bootstrap/main.py, api/main.py, ... — don't hardcode it (E3-v2
+    put it at bootstrap/main.py, so `from app.main import app` false-failed a
+    working app). Find the file that instantiates FastAPI() and derive its dotted
+    import; prefer a file named main.py."""
+    best = None
+    for src in sorted(backend.rglob("*.py")):
+        if _APP_SKIP & set(src.relative_to(backend).parts):
+            continue
+        try:
+            text = src.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # A module-level ASGI app var at column 0: 'app = ...', 'app: FastAPI = ...',
+        # or 'application = ...'. Covers both `app = FastAPI()` and the common
+        # factory pattern `app: FastAPI = create_app()` (E3-v2's bootstrap/main.py).
+        m = re.search(r"(?m)^(app|application)\b[^=\n]*=(?!=)", text)
+        if not m:
+            continue
+        dotted = src.relative_to(backend).with_suffix("").as_posix().replace("/", ".")
+        stmt = f"from {dotted} import {m.group(1)}"
+        if src.name == "main.py":
+            return stmt
+        best = best or stmt
+    return best or "from app.main import app"
+
+
 def _check_import(py: str, backend: Path) -> dict:
-    ok, detail, elapsed = _run([py, "-c", "from app.main import app"], backend, 60)
-    return {"passed": ok, "detail": detail, "elapsed_sec": elapsed}
+    stmt = _discover_app_import(backend)
+    ok, detail, elapsed = _run([py, "-c", stmt], backend, 60)
+    return {"passed": ok, "detail": (detail if ok else f"[{stmt}] {detail}"),
+            "elapsed_sec": elapsed}
 
 
 def _check_alembic(py: str, backend: Path, build_dir: Path) -> dict:
@@ -176,7 +218,8 @@ def _check_pytest(py: str, backend: Path, code_dir: Path, build_dir: Path) -> di
     junit = build_dir / "verify_junit.xml"
     junit.unlink(missing_ok=True)
     ok, detail, elapsed = _run(
-        [py, "-m", "pytest", "-q", "--tb=short", f"--junitxml={junit}", *ignores],
+        [py, "-m", "pytest", "-q", "--tb=short", "--timeout=45", "--timeout-method=thread",
+         f"--junitxml={junit}", *ignores],
         backend, timeout)
     failures = _parse_junit(junit)
     if "no tests ran" in detail or "[exit 5]" in detail:

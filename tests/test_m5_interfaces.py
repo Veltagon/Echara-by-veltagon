@@ -129,3 +129,19 @@ def test_empty_file_list_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(builder.skills_router, "DEFAULT_POOL_ROOT", tmp_path / "nopool")
     with pytest.raises(builder.BuildDispatchFailed, match="no file list"):
         builder.run_builder(build)
+
+
+def test_interface_index_excludes_node_modules_and_caps(tmp_path):
+    # A frontend module whose dir contains node_modules must NOT index it — that
+    # blew the index to 3.8MB and made frontend modules unbuildable (E3-v2).
+    from agents import interfaces
+    mod = tmp_path / "build" / "code" / "frontend"   # ancestor named 'build' (a skip word)
+    (mod / "src").mkdir(parents=True)
+    (mod / "src" / "App.tsx").write_text("export function App() { return null; }\n")
+    nm = mod / "node_modules" / "@babel" / "core"
+    nm.mkdir(parents=True)
+    (nm / "index.js").write_text("export const junk = 1;\n" * 2000)
+    md = interfaces.module_interface_md(mod, "frontend_core")
+    assert "App" in md                       # real source kept
+    assert "junk" not in md and "node_modules" not in md  # deps excluded
+    assert len(md) < 2000                     # tiny, not megabytes

@@ -120,21 +120,40 @@ def file_interface(path: Path) -> list[str]:
     return []
 
 
+# Dirs that must NEVER be indexed — dependency/build output, not source. Without
+# this a frontend module whose path_root is `code/frontend` sweeps `node_modules`
+# (where npm install lands): the index exploded 421KB -> 3.8MB (518 files, mostly
+# @babel/*), 94% of a frontend wave prompt, blowing past every model's context and
+# making frontend modules unbuildable (E3-v2, 2026-07-07). Size-capped as a second
+# guard so no single module can ever dominate a wave's context.
+_SKIP_DIRS = frozenset({"__pycache__", "node_modules", "dist", "build", ".venv",
+                        ".verify_venv", ".next", ".turbo", "coverage", "out", ".git"})
+_MAX_INDEX_BYTES = 60_000  # ~15k tokens; a real module's signatures are far under this
+
+
 def module_interface_md(module_dir: Path, module_name: str) -> str:
     """Markdown interface index for one module: per-file exported signatures.
-    Only files that actually exist on disk are listed."""
+    Only real source files are listed (dependency/build dirs excluded) and the
+    whole index is byte-capped, so one module can't blow up a wave's context."""
     if not module_dir.is_dir():
         return f"## {module_name}\n(no files yet)\n"
     lines = [f"## module: {module_name}"]
+    size = len(lines[0])
     for f in sorted(module_dir.rglob("*")):
-        if f.suffix not in _CODE_SUFFIXES or "__pycache__" in f.parts:
+        if f.suffix not in _CODE_SUFFIXES:
+            continue
+        rel = f.relative_to(module_dir)
+        if _SKIP_DIRS & set(rel.parts):  # skip only dirs WITHIN the module (not ancestors)
             continue
         sigs = file_interface(f)
         if not sigs:
             continue
-        rel = f.relative_to(module_dir).as_posix()
-        lines.append(f"\n### {module_name}/{rel}")
-        lines.extend(sigs)
+        block = f"\n### {module_name}/{rel.as_posix()}\n" + "\n".join(sigs)
+        if size + len(block) > _MAX_INDEX_BYTES:
+            lines.append(f"\n### … index truncated at {_MAX_INDEX_BYTES} bytes")
+            break
+        lines.append(block)
+        size += len(block)
     return "\n".join(lines) + "\n"
 
 
